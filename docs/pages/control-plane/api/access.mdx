@@ -1,0 +1,128 @@
+---
+title: "Principals, Roles & Grants"
+description: "The iron-control access model over the API: principals, roles, grants, and API keys."
+---
+
+# Principals, Roles & Grants
+
+These resources implement the [access model](/control-plane/policies): which identity may use which credential. They share the standard [conventions](/control-plane/api/overview#conventions) for namespaces, foreign IDs, pagination, and upsert.
+
+## Principals
+
+A principal is an identity (an application, service, or proxy owner) that can be granted secrets and assigned to proxies.
+
+Attributes: `namespace`, `foreign_id`, `name`, `labels`. Only `name` and `labels` are mutable after create.
+
+### Create
+
+`POST /api/v1/principals`
+
+```json
+{ "data": { "foreign_id": "api-service", "name": "API Service", "labels": { "tier": "backend" } } }
+```
+
+Returns `201` with the principal's `id` (`prn_...`).
+
+### Operations
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| `GET`  | `/api/v1/principals?namespace=default` | List. |
+| `GET`  | `/api/v1/principals/:id` | Fetch by OID. |
+| `GET`  | `/api/v1/principals/lookup/:namespace/:foreign_id` | Fetch by namespace and foreign id. |
+| `GET`  | `/api/v1/principals/:id/effective_config` | [Effective config](/control-plane/api/proxies#effective-config) the principal resolves to. |
+| `GET`  | `/api/v1/principals/:principal_id/grants` | List grants made directly to the principal. |
+| `PUT`/`PATCH` | `/api/v1/principals/:id` | [Upsert](/control-plane/api/overview#upsert-with-put-and-patch). |
+
+## Roles
+
+A role is a reusable bundle of [grants](#grants). A principal's effective secrets are the union of its own direct grants and the grants of every role it holds. A principal may only be assigned roles in its own namespace.
+
+Attributes: `namespace`, `foreign_id`, `name`, `labels`.
+
+### Create
+
+`POST /api/v1/roles`
+
+```json
+{ "data": { "foreign_id": "infra", "name": "Infra", "labels": { "kind": "shared" } } }
+```
+
+Returns `201` with the role's `id` (`role_...`).
+
+### Operations
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| `GET`  | `/api/v1/roles?namespace=default` | List. |
+| `GET`  | `/api/v1/roles/:id` | Fetch by OID. |
+| `GET`  | `/api/v1/roles/lookup/:namespace/:foreign_id` | Fetch by namespace and foreign id. |
+| `GET`  | `/api/v1/roles/:role_id/grants` | List grants attached to the role. |
+| `PUT`/`PATCH` | `/api/v1/roles/:id` | [Upsert](/control-plane/api/overview#upsert-with-put-and-patch). |
+| `DELETE` | `/api/v1/roles/:id` | Delete (`204`). Cascades to the role's grants and assignments. |
+
+### Role Assignments
+
+Assign and unassign roles on a principal. The endpoints are nested under the principal; the role is identified by its OID.
+
+```json
+// POST /api/v1/principals/:principal_id/roles
+{ "data": { "role_id": "role_..." } }
+```
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| `GET`  | `/api/v1/principals/:principal_id/roles` | List assigned roles. |
+| `POST` | `/api/v1/principals/:principal_id/roles` | Assign a role. Cross-namespace or duplicate assignment returns `422`. |
+| `DELETE` | `/api/v1/principals/:principal_id/roles/:id` | Unassign. `204`, or `404` if not assigned. |
+
+## Grants
+
+A grant attaches exactly one secret to one **grantee** (a principal or a role). A principal receives a secret if it is granted directly or through any role it holds. Its proxies then receive that secret on [sync](/control-plane/api/proxies#proxy-sync).
+
+### Create
+
+`POST /api/v1/grants` with exactly one grantee (`principal_id` or `role_id`) and exactly one secret reference (`static_secret_id`, `gcp_auth_secret_id`, `oauth_token_secret_id`, `pg_dsn_secret_id`, or `hmac_secret_id`):
+
+```json
+{ "data": { "principal_id": "prn_...", "static_secret_id": "ssr_..." } }
+```
+
+Returns `201` with the grant's `id` (`grant_...`) and the one grantee key and one secret key that were set. A missing grantee or secret returns `404`. Supplying no grantee or no secret returns `422`.
+
+### Operations
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| `GET`  | `/api/v1/grants/:id` | Fetch one. |
+| `GET`  | `/api/v1/principals/:principal_id/grants` | List a principal's **direct** grants (paginated). |
+| `GET`  | `/api/v1/roles/:role_id/grants` | List a role's grants (paginated). |
+| `DELETE` | `/api/v1/grants/:id` | Revoke (`204`). |
+
+The principal grants endpoint lists only direct grants, not those resolved through roles. For everything a principal resolves to, use [effective config](/control-plane/api/proxies#effective-config).
+
+## API Keys
+
+API keys belong to the authenticated user and authenticate API requests. They are scoped to the current user: listing and fetching only ever return your own keys.
+
+### Create
+
+`POST /api/v1/api_keys`
+
+```json
+{ "data": { "name": "CI Runner" } }
+```
+
+Returns `201`. The plaintext `token` (`iak_...`) is included **only** in this response:
+
+```json
+{ "data": { "id": "ak_...", "name": "CI Runner", "token": "iak_0a1b2c3d..." } }
+```
+
+### Operations
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| `GET`  | `/api/v1/api_keys` | List your keys (paginated). Tokens are never returned. |
+| `GET`  | `/api/v1/api_keys/:id` | Fetch one (no token). |
+| `DELETE` | `/api/v1/api_keys/:id` | Revoke (soft delete, `204`). Revoking the key used for the current request returns `422`. |

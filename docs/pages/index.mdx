@@ -11,6 +11,8 @@ The allowlist is keyed on host. Domain globs (`*.anthropic.com`) and CIDRs both 
 
 Credentials stay in the proxy process. Static API keys swap in for placeholders the workload sends. OAuth bearer tokens, AWS SigV4 and HMAC signatures, and GCP service-account tokens are minted per request from longer-lived material the workload never sees. See [credential proxying](/credential-proxying/overview) for the full set.
 
+Credentials are not only for HTTP. iron-proxy can also sit in front of [PostgreSQL](/postgres): it holds the database connection string and pins every client session to a role the workload cannot escape, so untrusted code runs under row-level security without ever seeing the real DSN.
+
 Every request, allowed or blocked, becomes a JSON log line: host, method, path, status, duration, the policy that decided, the secrets injected. Pipe it to your SIEM, your warehouse, or `jq`.
 
 One YAML file configures all of it. The same binary runs as a sidecar, a systemd unit, a daemon, or a CI step.
@@ -41,4 +43,4 @@ If you want to see what a real config looks like before you commit, browse the [
 
 ## Open Source, With A Managed Option
 
-iron-proxy is [open source](https://github.com/ironsh/iron-proxy) and runs anywhere you can run a Linux process. A managed [control plane](/control-plane/overview) for policy, secrets, and audit aggregation across a fleet is in active development.
+iron-proxy is [open source](https://github.com/ironsh/iron-proxy) and runs anywhere you can run a Linux process. To manage a fleet, [iron-control](/control-plane/overview) is the control plane: it stores your credentials, decides which proxy may use which credential on which requests, and delivers each proxy its config with no per-host YAML to maintain. Available hosted or self-hosted.

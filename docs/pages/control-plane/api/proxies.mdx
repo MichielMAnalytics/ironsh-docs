@@ -1,0 +1,147 @@
+---
+title: "Proxies & Sync"
+description: "Register iron-proxy instances, assign them an identity, and the proxy sync and effective config endpoints."
+---
+
+# Proxies & Sync
+
+A proxy represents an iron-proxy instance. It may be assigned a [principal](/control-plane/api/access#principals), in which case it receives config for the secrets granted to that principal. A proxy can also boot **unassigned**: it authenticates and syncs normally but receives an empty config until a principal is assigned. The principal can be assigned, swapped, or cleared at any time without reissuing the token.
+
+A proxy's `status` is `assigned` when it currently holds a principal and `unassigned` otherwise. `principal_assigned_at` records when the current assignment was made.
+
+## Create
+
+`POST /api/v1/proxies`
+
+```json
+{ "data": { "name": "Edge Proxy - US", "principal_id": "prn_..." } }
+```
+
+Returns `201`. The plaintext proxy `token` (`iprx_...`) is included **only** in this response. Save it immediately; the proxy uses it to authenticate to [sync](#proxy-sync):
+
+```json
+{
+  "data": {
+    "id": "prx_...",
+    "name": "Edge Proxy - US",
+    "principal_id": "prn_...",
+    "status": "assigned",
+    "principal_assigned_at": "2026-06-01T10:00:00Z",
+    "token": "iprx_0a1b2c3d..."
+  }
+}
+```
+
+`name` is required. `principal_id` is optional: omit it for an unassigned proxy. When supplied, a missing principal returns `404`.
+
+## Assign, Swap, Or Clear The Principal
+
+`PATCH /api/v1/proxies/:id` (or `PUT`)
+
+```json
+{ "data": { "principal_id": "prn_..." } }
+```
+
+Assigns the principal when unassigned, or swaps it when already assigned. The token is unchanged; the proxy picks up the new config on its next [sync](#proxy-sync). Send `"principal_id": null` to unassign. Omitting `principal_id` leaves the assignment unchanged, and `name` may also be updated. Returns `200` with the updated proxy.
+
+## Other Operations
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| `GET`  | `/api/v1/proxies` | List. Optional `principal_id` filter; paginated. Tokens are never returned. |
+| `GET`  | `/api/v1/proxies/:id` | Fetch one (no token). |
+| `DELETE` | `/api/v1/proxies/:id` | Deregister (`204`). |
+
+Deleting a principal does not delete its proxies. They become unassigned and can be reassigned.
+
+## Proxy Sync
+
+`POST /api/v1/proxy/sync`
+
+Called by iron-proxy instances to fetch their configuration. **Authentication is the proxy bearer token** (`Authorization: Bearer iprx_...`), not an API key.
+
+The proxy sends the config hash it currently holds. If it matches the freshly computed hash, the server returns only the hash, so the proxy skips re-applying. Otherwise the full payload is returned.
+
+Request:
+
+```json
+{ "config_hash": "sha256:0a1b2c3d..." }
+```
+
+`config_hash` is optional. It is an opaque, deterministic fingerprint of the config that the proxy treats as an ETag.
+
+Response when the hash matches (no payload):
+
+```json
+{ "config_hash": "sha256:..." }
+```
+
+Response when the hash differs (full payload):
+
+```json
+{
+  "config_hash": "sha256:...",
+  "status": "assigned",
+  "principal_id": "prn_...",
+  "secrets": [
+    {
+      "source": { "type": "env", "var": "GITHUB_TOKEN" },
+      "inject": { "header": "Authorization", "formatter": "Bearer {{ .Value }}" },
+      "rules": [ { "host": "api.github.com", "methods": ["GET", "POST"], "paths": ["/repos/*"] } ]
+    }
+  ],
+  "transforms": [
+    {
+      "name": "gcp_auth",
+      "config": {
+        "keyfile": { "type": "aws_sm", "secret_id": "gcp-sa-keyfile", "region": "us-west-2" },
+        "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+        "rules": [ { "host": "googleapis.com", "methods": ["*"], "paths": ["/v1/*"] } ]
+      }
+    }
+  ],
+  "postgres": [
+    { "id": "pgs_...", "foreign_id": "analytics-pg", "dsn": { "type": "env", "var": "PG_ANALYTICS_DSN" }, "database": "analytics", "role": "readonly" }
+  ]
+}
+```
+
+The payload differs from the REST representation in a few ways:
+
+- `status` is `assigned` or `unassigned`, and `principal_id` is the assigned principal (or `null`). An unassigned proxy gets a valid response with empty `secrets` and `transforms`. These fields appear only in the full payload.
+- The config hash incorporates the principal assignment, so assigning, swapping, or clearing the principal always changes the hash. A swap is a full replacement: the proxy drops the previously delivered config rather than merging.
+- The delivered config covers the principal's **effective grants**: secrets granted directly plus those granted to any [role](/control-plane/api/access#roles) it holds. A secret reachable through more than one path appears once.
+- `secrets` carries one entry per granted static secret that has a source. `transforms` carries one `gcp_auth` per granted GCP auth secret, one `hmac_sign` per granted HMAC secret, and a single bundled `oauth_token` transform whose `config.tokens` lists every granted OAuth token secret.
+- `postgres` carries one entry per granted [PG DSN secret](/control-plane/api/secrets#pg-dsn-secrets), keyed by `foreign_id` (the key a [proxy-local listener](/postgres) binds to).
+- Each source is flattened: its `config` keys are merged up and tagged with `type`. A `control_plane` source delivers its decrypted value inline as `value`.
+- Rules use `methods` here, versus `http_methods` in the REST API.
+
+## Effective Config
+
+`GET /api/v1/principals/:id/effective_config`
+`GET /api/v1/principals/lookup/:namespace/:foreign_id/effective_config`
+
+The config a principal resolves to, in the same shape iron-proxy receives on [sync](#proxy-sync), for operator inspection. Use it to verify a grant change before pointing a live proxy at the principal.
+
+Unlike proxy sync, this endpoint never reveals live secrets and does no hash negotiation:
+
+- Inline `control_plane` source values are redacted to `"[redacted]"`. Every other source type carries only a reference (an env var name, an AWS secret id), so it passes through unchanged.
+- There is no `config_hash`, `status`, or `principal_id` field.
+- The response carries a content-derived `ETag` and `Cache-Control: no-store`.
+
+```json
+{
+  "data": {
+    "id": "prn_...",
+    "secrets": [
+      {
+        "source": { "type": "control_plane", "value": "[redacted]" },
+        "replace": { "proxy_value": "__DB_PASSWORD__" },
+        "rules": [ { "host": "db.internal", "methods": ["*"] } ]
+      }
+    ],
+    "transforms": [],
+    "postgres": []
+  }
+}
+```

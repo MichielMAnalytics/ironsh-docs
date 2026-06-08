@@ -1,0 +1,103 @@
+---
+title: "PostgreSQL Proxy"
+description: "iron-proxy can sit in front of PostgreSQL, hold the database credential, and pin every client session to a role so untrusted code runs under row-level security it cannot escape."
+---
+
+# PostgreSQL Proxy
+
+iron-proxy includes a PostgreSQL listener: a man-in-the-middle proxy for the Postgres wire protocol. It does for databases what [credential proxying](/credential-proxying/overview) does for HTTP. The client connects to the proxy with a credential the proxy manages, the proxy holds the real database connection string, and every session is pinned to a Postgres role the client cannot change.
+
+This solves identity-aware database access without touching application code. Point an untrusted workload at the proxy, and every query it runs executes under a fixed role, so [row-level security](https://www.postgresql.org/docs/current/ddl-rowsecurity.html) (RLS) policies on that role apply to everything the workload does.
+
+## How It Works
+
+The listener accepts client connections, authenticates them against a proxy-managed credential, then opens its own authenticated connection to the upstream database. The proxy terminates the upstream's authentication itself, handling MD5 and SCRAM-SHA-256. On that upstream session it issues `SET ROLE "<role>"` before handing the connection back. From that point the relay is essentially transparent: the client uses Postgres normally, and every query runs as the configured role.
+
+```
+client ──▶ iron-proxy ──▶ SET ROLE "<role>" ──▶ upstream PostgreSQL
+   │            │
+   │            └─ holds the real DSN; client never sees it
+   └─ authenticates with the proxy-managed client credential
+```
+
+The client never holds the real connection string, and it cannot change the role it was assigned. If the workload is compromised, there is no database credential to steal and no way to break out of the role.
+
+## Configuration
+
+The proxy runs a single PostgreSQL listener, configured under the top-level `postgres` key. One bind address serves many upstream databases. When the `postgres` block is omitted, no listener runs.
+
+```yaml
+postgres:
+  listen: ":5432"
+  # The single credential clients present to the proxy, shared across every
+  # upstream below. Routing is by database name, so per-database client
+  # credentials would add nothing.
+  client:
+    user: app_user
+    password_env: PG_PROXY_PASSWORD
+  upstreams:
+    # Clients connect with dbname=appdb to reach this upstream.
+    - database: appdb
+      # The DSN is loaded from any registered secret source and passed
+      # verbatim to the Postgres driver. URL or keyword/value form both work.
+      dsn:
+        type: env
+        var: PG_APPDB_DSN
+      # The role the proxy SETs at session start. Every query the client
+      # issues runs as this role on the upstream database.
+      role: tenant_role
+    # Clients connect with dbname=analyticsdb to reach this upstream.
+    - database: analyticsdb
+      dsn:
+        type: env
+        var: PG_ANALYTICS_DSN
+      role: analytics_role
+```
+
+| Field | Notes |
+|---|---|
+| `listen` | TCP address and port the listener binds. |
+| `client.user` | The username every client must present. |
+| `client.password_env` | Environment variable holding the password every client must present. |
+| `upstreams[].database` | Routing key. The client selects this upstream by sending this name as its database. |
+| `upstreams[].dsn` | A [secret source](/credential-proxying/overview#secret-sources) resolving to the upstream connection string. |
+| `upstreams[].role` | Optional. The role the proxy `SET`s on the upstream session. Omit for no role pinning. |
+
+The `dsn` is a standard iron-proxy secret source, so the connection string can come from an environment variable, AWS Secrets Manager, AWS SSM, or 1Password. See [Secret Sources](/credential-proxying/overview#secret-sources) for the full set.
+
+## Database Routing
+
+A single listener fronts many databases. The client picks one by the database name it sends in its startup message (`psql`'s `dbname=`). The proxy looks up the matching upstream, then authenticates against that upstream's own credentials before dialing it.
+
+The client must name a database explicitly. A database with no matching upstream is rejected. Each upstream's `database` must equal the database its DSN actually connects to (the `dbname` in the DSN), otherwise the client would land on a different database than the one it named, and the proxy rejects the connection.
+
+## What The Proxy Rejects
+
+To keep a client from escaping its assigned role, the proxy rejects any statement that would mutate the role. Rejections come back as a synthetic `ErrorResponse`, so the connection stays usable. Every check parses the SQL with `libpg_query` and walks the syntax tree, so it catches a role-mutating construct anywhere in the query: inside CTEs, subqueries, function arguments, and so on.
+
+Rejected:
+
+- `SET ROLE`, `RESET ROLE`, `SET SESSION AUTHORIZATION`, `RESET SESSION AUTHORIZATION`. Direct mutation of the session role.
+- `SELECT set_config('role', ...)`, `SELECT pg_catalog.set_config(...)`, and the same for `session_authorization`. Function-call bypasses.
+- `DO $$ ... $$` blocks. The PL/pgSQL body is opaque to the SQL parser, so the proxy rejects it rather than risk an embedded role change.
+- Multi-statement Simple Queries. Kept as a single-statement guard.
+
+Some elevation paths cannot be caught at the wire. Defend against these at the database with your role and grant configuration:
+
+- User-defined `SECURITY DEFINER` functions that elevate internally.
+- Dynamic SQL via PL/pgSQL `EXECUTE` with a non-literal argument.
+- Functions that wrap `set_config` under a different name.
+
+## Connection Pooler Requirement
+
+If PgBouncer or any other pooler sits between iron-proxy and PostgreSQL, it **must** be configured with `pool_mode = session`. Transaction-mode and statement-mode pooling silently rebind backends between queries, which makes the role the proxy set on one backend invisible to the next query running on another backend. That defeats RLS without surfacing any error. This constraint is enforced by your deployment configuration: the proxy does not probe for it at runtime.
+
+## Limitations
+
+- Client-to-proxy TLS is not supported. The proxy refuses `SSLRequest`. Secure the client-to-proxy hop with network controls (a private network or localhost).
+- `CancelRequest` is not forwarded.
+- One shared client credential per listener. There are no per-user client credentials. Identity is expressed by the upstream role, not the client login.
+
+## With The Control Plane
+
+Everything above configures a standalone proxy through its YAML file. To manage Postgres upstreams centrally across a fleet, define them in [iron-control](/control-plane/overview) as **PG DSN secrets** and grant them to a principal. The control plane delivers them to each proxy, keyed by name, where the local listener binds to them. See [PG DSN secrets](/control-plane/api/secrets#pg-dsn-secrets) in the control plane API.

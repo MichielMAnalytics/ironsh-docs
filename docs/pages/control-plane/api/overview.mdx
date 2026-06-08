@@ -1,88 +1,150 @@
 ---
 title: "API Overview"
-description: "Base URL, authentication, and conventions for the iron.sh control plane API."
+description: "Base URL, authentication, conventions, and the shared building blocks of the iron-control JSON API."
 ---
 
 # API Overview
 
-The control plane exposes a JSON API for managing policies, proxies, and other fleet resources. Anything you can do in the control plane UI under **Policies** is available over the API.
+iron-control exposes a JSON API under `/api/v1`. Operators use it to manage credentials, principals, roles, grants, and proxies. Anything the read-only console shows, the API can create and change.
+
+Every resource endpoint authenticates with an API key. The single exception is [`POST /api/v1/proxy/sync`](/control-plane/api/proxies#proxy-sync), which iron-proxy instances call with their own proxy token.
 
 ## Base URL
 
-All API requests are made against the `api` subdomain of your control plane:
+All requests go to the `/api/v1` path on your control plane. The hosted default is:
 
 ```
-https://api.iron.sh/v1
+https://api.iron.sh/api/v1
 ```
 
-Self-hosted deployments substitute their own host. The API path layout (`/v1/...`) is identical.
+Self-hosted deployments substitute their own host. The path layout is identical.
 
 ## Authentication
 
-The API uses bearer tokens. Create an API key in the control plane UI under **API Keys**, then include it in the `Authorization` header on every request:
+Send your API key as a bearer token:
 
-```http
-Authorization: Bearer <your_api_key>
+```
+Authorization: Bearer iak_<64 lowercase hex chars>
 ```
 
-API keys are scoped to the organization that created them. Requests with a missing or invalid token return `401 Unauthorized`.
-
-## Content Type
-
-`POST`, `PUT`, and `PATCH` requests must send `Content-Type: application/json`. The API rejects other content types with `415 Unsupported Media Type`:
+API keys have the form `iak_` followed by 64 lowercase hex characters. Create one with [`POST /api/v1/api_keys`](/control-plane/api/access#api-keys). The plaintext token is shown only once, when the key is created (or, for the bootstrap key, logged once at startup). Tokens are stored as SHA-256 hashes and cannot be recovered. A missing or invalid token returns `401`:
 
 ```json
-{
-  "error": {
-    "code": "unsupported_media_type",
-    "message": "Content-Type must be application/json"
-  }
-}
+{ "error": { "message": "invalid or missing API key" } }
 ```
 
-## Identifiers
+iron-proxy instances authenticate to proxy sync with their own token (`iprx_` followed by 64 lowercase hex characters), issued once when the proxy is created. An invalid proxy token returns `401` with `"invalid or missing proxy token"`.
 
-Every resource is addressed by an opaque, prefixed ID. Network policies start with `npol_`, secret policies with `spol_`, and MCP policies with `mpol_`. Treat IDs as opaque strings: do not parse, generate, or assume anything about their format beyond the prefix.
+## Conventions
+
+- **Request bodies** wrap attributes in a top-level `data` object. A missing `data` key returns `400`.
+- **Single-resource responses** wrap the resource in `data`.
+- **List responses** include `data` (an array) and `meta` (pagination):
+
+  ```json
+  {
+    "data": [ /* ... */ ],
+    "meta": { "page": 1, "limit": 50, "total": 100, "total_pages": 2 }
+  }
+  ```
+
+- **Pagination** uses `page` (default `1`) and `limit` (default `50`, max `200`). Values are clamped into range. A non-integer value returns `400`.
+- **Namespaced list filtering** (secrets, principals, roles) requires a `namespace` query parameter and accepts an optional `labels[key]=value` filter that matches by JSONB containment: all supplied pairs must be present. Label values must be scalars.
+- **Object IDs** are prefixed by type: `ssr_` (static secret), `gas_` (GCP auth secret), `ots_` (OAuth token secret), `pgs_` (PG DSN secret), `hms_` (HMAC secret), `bcr_` (broker credential), `prn_` (principal), `role_` (role), `grant_` (grant), `ak_` (API key), `prx_` (proxy). Treat them as opaque.
+- **`namespace`** defaults to `"default"` when omitted on create. Once set, `namespace` and `foreign_id` are immutable.
+- **`namespace` and `foreign_id`** must be URL-safe: only `A-Z a-z 0-9 - . _ ~`. `foreign_id` is optional and, when set, must be unique within its namespace. A `foreign_id` may not start with the resource's id prefix, so it can never be mistaken for an OID.
+- **`labels`** is an arbitrary string-keyed object, defaulting to `{}`.
+- **Timestamps** are ISO 8601 UTC.
+
+### Upsert With PUT And PATCH
+
+For resources with a `foreign_id` (secrets, principals, roles), `PUT`/`PATCH /api/v1/<resource>/:id` is an **upsert**, and `:id` may be an OID or a `foreign_id`:
+
+- **`:id` is an OID** (starts with the resource's prefix, such as `ssr_`): updates that record. `404` if it does not exist, since an OID is server-assigned.
+- **`:id` is anything else**: it is treated as a `foreign_id` within the body's `namespace` (default `"default"`). The record is updated if it exists, created if it does not. Creation responds `201`; update responds `200`.
+
+This makes provisioning idempotent. `PUT /api/v1/roles/infra` with `{"data":{"namespace":"acme", ...}}` converges the `acme/infra` role in one call whether or not it already exists.
 
 ## Errors
 
-Errors return a JSON body with a stable `code` and a human-readable `message`:
+Errors return an `error` object with a `message` and, for validation failures, a `details` map of field name to messages:
 
 ```json
 {
   "error": {
-    "code": "validation_error",
-    "message": "Name has already been taken"
+    "message": "validation failed",
+    "details": {
+      "base": ["must define one of inject_config or replace_config"],
+      "name": ["can't be blank"]
+    }
   }
 }
 ```
 
-Common codes across policy endpoints:
+| Status | Meaning |
+| ------ | ------- |
+| `200`  | OK |
+| `201`  | Created |
+| `204`  | No Content (successful `DELETE`) |
+| `400`  | Bad Request (missing `data`, bad pagination or label query) |
+| `401`  | Unauthorized (missing or invalid token) |
+| `404`  | Not Found |
+| `409`  | Conflict (for example, deleting a broker credential still in use) |
+| `422`  | Unprocessable Entity (validation failed) |
 
-| Status | Code | Meaning |
-|---|---|---|
-| 401 | `unauthorized` | Missing or invalid API key. |
-| 404 | `network_policy_not_found`, `secret_policy_not_found`, `mcp_policy_not_found` | The ID does not exist or belongs to a different organization. |
-| 409 | `network_policy_name_taken`, `secret_policy_name_taken`, `mcp_policy_name_taken` | A policy with that name already exists in the organization. |
-| 415 | `unsupported_media_type` | `Content-Type` is not `application/json`. |
-| 422 | `validation_error` | The request body failed validation. The `message` lists the failing fields. |
+## Shared Building Blocks
 
-## Server-Owned Fields
+Two structures appear across many resources: secret sources and request rules.
 
-The API ignores fields that are owned by the server: `id`, `organization_id`, `created_by_id`, `created_at`, `updated_at`. Sending them in `POST` or `PATCH` bodies is harmless: the values you supply are dropped and the server fills the canonical values in the response.
+### Secret Sources
 
-## Listing and Filtering
-
-List endpoints return all matching resources in a single response under `data`, ordered by `priority` ascending:
+A secret source describes where a credential value is resolved from. It appears as the `source` of a static secret, the `keyfile` of a GCP auth secret, the `dsn` of a PG DSN secret, and each entry in an OAuth or HMAC secret's `credentials` map.
 
 ```json
-{ "data": [ { "id": "npol_...", "name": "default-egress", ... } ] }
+{ "source_type": "env", "config": { "var": "GITHUB_TOKEN" } }
 ```
 
-Most list endpoints accept `name` and `active` query parameters as exact-match filters.
+`source_type` is required and immutable. `config` is an object whose allowed keys depend on the type. Unknown keys are rejected. Every type also accepts the optional keys `json_key` (extract one field from a JSON value) and `ttl` (cache lifetime).
 
-## Resources
+| `source_type` | Required `config` keys | Type-specific optional keys | Notes |
+| ------------- | ---------------------- | --------------------------- | ----- |
+| `env`         | `var`        | | Reads a process environment variable. |
+| `aws_sm`      | `secret_id`  | `region` | AWS Secrets Manager. |
+| `aws_ssm`     | `name`       | `region`, `with_decryption` | AWS SSM Parameter Store. |
+| `1password`   | `secret_ref` | `token_env` | 1Password CLI or service account. |
+| `1password_connect` | `secret_ref` | `host_env`, `token_env` | 1Password Connect server. |
+| `control_plane` | (none)     | | Value stored inline in iron-control. See below. |
+| `token_broker`  | `credential_id` | `credential_namespace` | A managed [broker credential](/control-plane/api/secrets#broker-credentials). See below. |
 
-- [Network Policies](/control-plane/api/network-policies)
-- [Secret Policies](/control-plane/api/secret-policies)
-- [MCP Policies](/control-plane/api/mcp-policies)
+`control_plane` is special. The value is stored in iron-control itself. Supply it as a top-level `secret` field on the source (not inside `config`), and leave `config` empty:
+
+```json
+{ "source_type": "control_plane", "secret": "the-actual-secret-value", "config": {} }
+```
+
+The `secret` field is encrypted at rest, is write-only, and is never returned in any response. It is only permitted for `control_plane` sources.
+
+`token_broker` is also resolved by iron-control, not the proxy. `credential_id` names a [broker credential](/control-plane/api/secrets#broker-credentials), and at sync time iron-control substitutes that credential's current access token, delivered inline exactly like a `control_plane` value. The reference never reaches the proxy. With a `foreign_id`, `credential_namespace` is required; with an opaque id it must be omitted.
+
+### Request Rules
+
+A rule scopes a credential to matching outbound requests. Rules appear as the `rules` array of static, GCP auth, OAuth, and HMAC secrets.
+
+```json
+{ "host": "api.github.com", "http_methods": ["GET", "POST"], "paths": ["/repos/*"] }
+```
+
+| Field | Type | Notes |
+| ----- | ---- | ----- |
+| `host` | string | Hostname to match. Exactly one of `host` or `cidr` is required. |
+| `cidr` | string | CIDR block to match, such as `10.0.0.0/8`. |
+| `http_methods` | array of strings | Each is one of `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT`, or `*`. |
+| `paths` | array of strings | Each must start with `/`. Globs such as `/repos/*` are allowed. |
+
+Rules are positional. A `position` (0-based, from array order) is returned in responses but is not part of the request. On update, the supplied `rules` array fully replaces the existing rules.
+
+## Reference Pages
+
+- [Secrets](/control-plane/api/secrets): the five credential types plus broker credentials.
+- [Principals, Roles & Grants](/control-plane/api/access): the access model and API keys.
+- [Proxies & Sync](/control-plane/api/proxies): proxy registration, sync, and effective config.

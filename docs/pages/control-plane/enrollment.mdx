@@ -1,86 +1,105 @@
 ---
-title: "Enrollment"
-description: "Connect an iron-proxy instance to the control plane using an enrollment token."
+title: "Connecting Proxies"
+description: "Register an iron-proxy with iron-control, point it at the control plane with its token, and assign it an identity."
 ---
 
-# Enrollment
+# Connecting Proxies
 
-A new iron-proxy joins the control plane by running a one-time `init` command with an enrollment token. The proxy registers itself, picks up the tags configured on the token, pulls its initial configuration, and begins reporting audit events. After enrollment, the proxy stores a long-lived credential on disk and does not need the enrollment token again.
+An iron-proxy connects to iron-control in **managed mode**. You register the proxy in the control plane, which issues it a token, then start the proxy with that token. From boot on, the proxy fetches its configuration from the control plane and holds no local secrets or policy.
 
-## Enroll a Proxy
+A proxy is tied to an **identity**, called a [principal](/control-plane/policies). The proxy receives exactly the credentials its principal is granted. You can assign, swap, or clear the principal at any time without touching the proxy or reissuing its token.
+
+## Connect A Proxy
+
+These steps use the [JSON API](/control-plane/api/overview). The console is read-only, so proxies and principals are created over the API. Set `IRON_CONTROL_URL` to your control plane (the hosted default is `https://api.iron.sh`) and `IRON_API_KEY` to an [API key](/control-plane/api/overview#authentication).
 
 ::::steps
-### Create an Enrollment Token
 
-In the control plane UI, open the **Proxies** tab and click **Add Proxy**.
+### Create A Principal
 
-<img src="/images/control-plane-add-proxy.png" alt="The Add Proxy dialog, showing Tags, Key Expiry, and Max Uses fields" style={{ marginTop: "1rem" }} />
+A principal is the identity the proxy runs as. Create one (or reuse an existing one):
 
-Fill in:
-
-- **Tags.** Labels that will be assigned to any proxy registered with this token. Type a tag and press comma or enter to add it.
-- **Key Expiry.** How long the token can be redeemed before it is no longer valid.
-- **Max Uses.** How many proxies this token can register. `0` means unlimited.
-
-Click **Add Proxy**. The control plane displays the enrollment token once.
-
-<img src="/images/control-plane-bootstrap-token.png" alt="Success message showing the enrollment token with its tags and expiry" style={{ marginTop: "1rem" }} />
-
-Copy the token immediately. It will not be shown again.
-
-### Run `init` on the Host
-
-On the machine where iron-proxy will run, execute:
-
-```bash
-sudo ./iron-proxy init \
-  -enrollment-token 1a46ef8a2f34650f6b3fba5f20990dde0910060d9faab3dfba9ab168cf4f3f43
+```sh
+curl -X POST "$IRON_CONTROL_URL/api/v1/principals" \
+  -H "Authorization: Bearer $IRON_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "data": { "foreign_id": "checkout-service", "name": "Checkout Service" } }'
 ```
 
-The `init` subcommand exchanges the enrollment token for a long-lived proxy credential, registers the proxy with the control plane along with the tags configured on the token, pulls the initial policy, installs the iron-proxy systemd services, and starts the `iron-proxy` service. When it returns, the proxy is already running and connected to the control plane.
+The response includes the principal id (`prn_...`). Grant it the credentials it should use through [grants](/control-plane/policies#grants).
 
-`sudo` is required because the state directory, iptables rules, and systemd units are all system-wide.
+### Register The Proxy
 
-### Verify It Registered
+Create a proxy record. Pass the `principal_id` to assign it now, or omit it to register an unassigned proxy you assign later:
 
-Back in the **Proxies** tab, the new proxy appears in the list with its tags and `Active` status.
+```sh
+curl -X POST "$IRON_CONTROL_URL/api/v1/proxies" \
+  -H "Authorization: Bearer $IRON_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "data": { "name": "Edge Proxy - US", "principal_id": "prn_..." } }'
+```
 
-<img src="/images/control-plane-proxies-list.png" alt="The Proxies list showing the newly enrolled proxy with its tags and status" style={{ marginTop: "1rem" }} />
+The response contains the proxy's token (`iprx_...`):
+
+```json
+{
+  "data": {
+    "id": "prx_...",
+    "name": "Edge Proxy - US",
+    "principal_id": "prn_...",
+    "status": "assigned",
+    "token": "iprx_0a1b2c3d..."
+  }
+}
+```
+
+:::warning
+The token is shown **only** in this create response. Copy it immediately. It is stored as a hash and cannot be recovered. If you lose it, deregister the proxy and create a new one.
+:::
+
+### Start The Proxy In Managed Mode
+
+On the host, start iron-proxy with the token. Managed mode is enabled by the presence of a control plane token, supplied either with the `-token` flag or the `IRON_PROXY_TOKEN` environment variable. `IRON_CONTROL_PLANE_URL` points at the control plane and defaults to `https://api.iron.sh`:
+
+```sh
+export IRON_PROXY_TOKEN=iprx_0a1b2c3d...
+export IRON_CONTROL_PLANE_URL=https://api.iron.sh   # your host, if self-hosted
+iron-proxy
+```
+
+On boot the proxy registers, fetches the configuration for its assigned principal, and begins adding the granted credentials to matching requests. No YAML credential config is needed: in managed mode the control plane is the source of truth.
 
 ::::
 
-## Customizing the Generated Config
+## Assigning And Swapping Identity
 
-`init` writes a config file to the proxy's state directory. It is preconfigured to connect to the control plane and apply the policy you just pulled, and will work as-is for most deployments.
+A proxy can boot **unassigned**. It authenticates and syncs normally but receives an empty configuration until a principal is assigned. Assign or swap the principal with a `PATCH`, and the proxy picks up the new config on its next sync. The token never changes:
 
-Anything in the standard [iron-proxy configuration](/reference/configuration) can be edited directly in the file: listen ports, upstream resolvers, log format, extra transforms. After editing, restart the service to pick up the changes:
-
-```bash
-sudo systemctl restart iron-proxy
+```sh
+curl -X PATCH "$IRON_CONTROL_URL/api/v1/proxies/prx_..." \
+  -H "Authorization: Bearer $IRON_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "data": { "principal_id": "prn_..." } }'
 ```
 
-Control-plane-managed fields (policy, secret mappings, tags) are refreshed from the control plane on every reconnect, so local edits to those fields will be overwritten. Edit them in the control plane UI instead.
+Send `"principal_id": null` to unassign. A swap is a full replacement: the proxy drops the previously delivered config rather than merging. Deleting a principal does not delete its proxies; they become unassigned and can be reassigned.
 
-## Tags
+## Fetching Configuration
 
-Each proxy carries a set of colon-separated labels that identify it and its workload. Tags can be bare strings like `dev` or namespaced like `env:prod`. Every audit event is indexed by the proxy's tags, so fleet-wide queries like "show every request from `env:prod` `service:checkout`" are cheap.
+The proxy keeps its config current by calling [`POST /api/v1/proxy/sync`](/control-plane/api/proxies#proxy-sync) with its own token. It sends the content hash of the config it currently holds. If that matches what the control plane computes, it gets back only the hash and applies nothing. Otherwise it gets the full payload. This is how a grant change or a rotated secret reaches the fleet without restarts.
 
-Tags are configured on the enrollment token in the control plane UI. Every proxy registered with the token inherits that tag set.
+## Managed PostgreSQL Listener
 
-Changing a proxy's tags after enrollment is not yet exposed in the UI. For now, re-enroll the proxy with a fresh enrollment token to assign a new tag set.
+A proxy in managed mode runs a [PostgreSQL listener](/postgres) for any [PG DSN secrets](/control-plane/api/secrets#pg-dsn-secrets) its principal is granted. The upstream databases, connection strings, and roles come from the control plane. The listener's own bind address and the client credential are local deployment concerns, set with environment variables:
 
-## Enrollment Tokens
+| Variable | Notes |
+|---|---|
+| `IRON_PROXY_PG_LISTEN` | Address and port the listener binds, e.g. `:5432`. |
+| `IRON_PROXY_PG_CLIENT_USER` | The username clients present to the proxy. |
+| `IRON_PROXY_PG_CLIENT_PASSWORD` | The password clients present to the proxy. |
 
-Each enrollment is authorized by a short-lived credential that exists only for the handshake. Once the proxy has its long-lived credential, the token is discarded.
+When all three are set and the principal is granted at least one PG DSN secret, the proxy starts the listener and routes clients to upstreams by database name. If a local YAML `postgres` block is also present, the synced upstreams layer on top of it, reusing its bind address and client credential.
 
-`Max Uses` controls how many proxies a single token can register:
+## Per-Tenant And Per-User Proxies
 
-- **1** is the tightest setting: the token can enroll exactly one proxy, then is dead. Prefer this for provisioning flows that hand out a token per host.
-- **A small integer** fits short-lived autoscaling groups where a handful of proxies will come up from the same enrollment token.
-- **0** (unlimited) fits base images or long-lived pools. Pair with a short `Key Expiry` so the blast radius of a leaked token stays bounded.
-
-## Troubleshooting
-
-**Token expired.** The token's `Key Expiry` window has passed. Generate a new enrollment token and retry.
-
-**Max uses exceeded.** The enrollment token has already been redeemed `Max Uses` times. Generate a new token or increase `Max Uses` on the next one.
+To scope a proxy to a single tenant, customer, or user, give it a principal that represents that identity. Create one principal per tenant (`foreign_id: "tenant-acme"`), grant it only that tenant's credentials, and assign it to the proxies that run on the tenant's behalf. Each proxy then reaches only what its tenant is granted, and the proxy's [audit log](/guides/otel-export) is a per-identity record of every request it made. Shared baseline credentials are best modeled as a [role](/control-plane/policies#roles) assigned to every principal.

@@ -176,6 +176,7 @@ export default defineConfig({
         { text: "LLM Judge", link: "/policies/llm-judge" },
         { text: "Header Allowlist", link: "/policies/header-allowlist" },
         { text: "MCP Interception", link: "/policies/mcp-interception" },
+        { text: "PostgreSQL Proxy", link: "/postgres" },
       ],
     },
     {
@@ -200,8 +201,8 @@ export default defineConfig({
           collapsed: false,
           items: [
             { text: "Overview", link: "/control-plane/overview" },
-            { text: "Enrollment", link: "/control-plane/enrollment" },
-            { text: "Policies", link: "/control-plane/policies" },
+            { text: "Connecting Proxies", link: "/control-plane/enrollment" },
+            { text: "Access Model", link: "/control-plane/policies" },
             { text: "Self-Hosted", link: "/control-plane/self-hosted" },
           ],
         },
@@ -226,9 +227,9 @@ export default defineConfig({
           collapsed: true,
           items: [
             { text: "Overview", link: "/control-plane/api/overview" },
-            { text: "Network Policies", link: "/control-plane/api/network-policies" },
-            { text: "Secret Policies", link: "/control-plane/api/secret-policies" },
-            { text: "MCP Policies", link: "/control-plane/api/mcp-policies" },
+            { text: "Secrets", link: "/control-plane/api/secrets" },
+            { text: "Principals, Roles & Grants", link: "/control-plane/api/access" },
+            { text: "Proxies & Sync", link: "/control-plane/api/proxies" },
           ],
         },
       ],

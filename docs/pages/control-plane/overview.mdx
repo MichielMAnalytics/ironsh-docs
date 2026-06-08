@@ -1,115 +1,62 @@
 ---
 title: "Overview"
-description: "Centralized policy, audit, and fleet management for iron-proxy. Hosted or self-hosted."
+description: "iron-control is the control plane for iron-proxy: it stores credentials, decides which proxy may use which credential on which requests, and hands each proxy its configuration."
 ---
 
 # Overview
 
-A single iron-proxy is a default-deny firewall for one workload. A fleet of them is a distributed system, and distributed systems need a control plane. The iron-proxy control plane is that layer.
+**iron-control** is the control plane for iron-proxy. It stores your credentials, decides which proxy may use which credential on which requests, and hands each proxy its configuration. Proxies hold no secrets of their own and no local policy: they register, fetch their config from iron-control, and apply it.
 
-Policies are authored once and converge across every connected proxy in seconds. New proxies enroll on boot with a short-lived token and pull their config on first connect. There is nothing baked into the image and nothing to template per host. Every intercepted request from every proxy streams into a unified audit store you can query by workload, destination, policy decision, or injected secret.
+Where a standalone proxy reads its setup from a [local YAML file](/reference/configuration), a proxy connected to iron-control gets everything from the control plane. Credentials and access rules live in one place, and changes reach every proxy on its next sync.
 
-## Architecture
+## How It Fits Together
 
-<svg
-  viewBox="0 0 800 400"
-  xmlns="http://www.w3.org/2000/svg"
-  role="img"
-  aria-label="Operators author policies in the control plane, which pushes configuration down to enrolled proxies and ingests their audit events. Each proxy intercepts egress traffic from its workload."
-  style={{ width: "100%", height: "auto", marginTop: "1.5rem", marginBottom: "1.5rem", color: "currentColor" }}
->
-  <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
-    </marker>
-    <marker id="arrowAccent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M0,0 L10,5 L0,10 z" fill="#e05a2b" />
-    </marker>
-  </defs>
+```
+  operator ──▶ console / JSON API ──▶ iron-control ──▶ Postgres (encrypted secrets)
+                                           ▲
+                                           │ POST /api/v1/proxy/sync (iprx_ token)
+                                           │
+  workload ──▶ iron-proxy ─────────────────┘
+                   │
+                   └──▶ upstream APIs (credentials added per request rules)
+```
 
-  <g fontFamily="ui-sans-serif, system-ui, sans-serif" fontSize="13" fill="currentColor">
-    <rect x="20" y="20" width="140" height="56" rx="6" fill="none" stroke="currentColor" strokeWidth="1.5" />
-    <text x="90" y="44" textAnchor="middle" fontWeight="600">Operator</text>
-    <text x="90" y="62" textAnchor="middle" opacity="0.7">authors policy</text>
+Operators manage credentials, principals, roles, and grants through the API or the console. Each iron-proxy signs in with its own token, fetches the configuration for its assigned identity, and adds the granted credentials to matching outbound requests. The credentials themselves stay in the control plane.
 
-    <rect x="240" y="10" width="320" height="76" rx="8" fill="#e05a2b" stroke="#e05a2b" strokeWidth="1.5" />
-    <text x="400" y="36" textAnchor="middle" fontWeight="700" fill="#ffffff">Control Plane</text>
-    <text x="400" y="56" textAnchor="middle" fill="#ffffff" opacity="0.92">Policies · Enrollment · Audit Store</text>
-    <text x="400" y="72" textAnchor="middle" fill="#ffffff" opacity="0.75" fontSize="11">hosted or self-hosted</text>
+## The Model
 
-    <line x1="160" y1="48" x2="240" y2="48" stroke="currentColor" strokeWidth="1.5" markerEnd="url(#arrow)" />
+iron-control has a small, composable model. Four concepts cover the whole system.
 
-    <g stroke="#e05a2b" strokeWidth="1.5" fill="none">
-      <path d="M 320 86 L 320 160 L 150 160 L 150 200" markerEnd="url(#arrowAccent)" />
-      <path d="M 400 86 L 400 200" markerEnd="url(#arrowAccent)" />
-      <path d="M 480 86 L 480 160 L 650 160 L 650 200" markerEnd="url(#arrowAccent)" />
-    </g>
-    <text x="400" y="118" textAnchor="middle" fill="#e05a2b" fontSize="11" fontWeight="600">live config push</text>
+**Credentials.** Each secret is a typed record. The five grantable kinds map to the [credential proxying](/credential-proxying/overview) mechanisms: [static secrets](/credential-proxying/static-secrets), [GCP service-account auth](/credential-proxying/gcp-auth), [OAuth tokens](/credential-proxying/oauth-token), [HMAC signing keys](/credential-proxying/hmac-sign), and [Postgres connection strings](/postgres). A value is either kept inline and encrypted, or pulled from an external store such as AWS Secrets Manager, AWS SSM, or 1Password.
 
-    <g stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 3" fill="none" opacity="0.55">
-      <path d="M 170 200 L 170 140 L 360 140 L 360 86" markerEnd="url(#arrow)" />
-      <path d="M 420 200 L 420 96" markerEnd="url(#arrow)" />
-      <path d="M 670 200 L 670 140 L 440 140 L 440 86" markerEnd="url(#arrow)" />
-    </g>
-    <text x="600" y="132" textAnchor="middle" fill="currentColor" fontSize="11" opacity="0.7">audit events</text>
+**Principals.** A principal is an identity that a proxy runs as: an application, a service, a tenant. A proxy is assigned one principal and receives the credentials that principal can use.
 
-    <g>
-      <rect x="80" y="200" width="140" height="60" rx="6" fill="none" stroke="currentColor" strokeWidth="1.5" />
-      <text x="150" y="224" textAnchor="middle" fontWeight="600">iron-proxy</text>
-      <text x="150" y="244" textAnchor="middle" opacity="0.7" fontSize="11">env:dev</text>
+**Roles.** A role bundles credentials so they can be assigned together. A principal can hold any number of roles, and its effective credentials are its own direct grants plus the grants of every role it holds.
 
-      <rect x="330" y="200" width="140" height="60" rx="6" fill="none" stroke="currentColor" strokeWidth="1.5" />
-      <text x="400" y="224" textAnchor="middle" fontWeight="600">iron-proxy</text>
-      <text x="400" y="244" textAnchor="middle" opacity="0.7" fontSize="11">env:prod · ci</text>
-
-      <rect x="580" y="200" width="140" height="60" rx="6" fill="none" stroke="currentColor" strokeWidth="1.5" />
-      <text x="650" y="224" textAnchor="middle" fontWeight="600">iron-proxy</text>
-      <text x="650" y="244" textAnchor="middle" opacity="0.7" fontSize="11">tenant:acme</text>
-    </g>
-
-    <g stroke="currentColor" strokeWidth="1.5" fill="none">
-      <line x1="150" y1="320" x2="150" y2="262" markerEnd="url(#arrow)" />
-      <line x1="400" y1="320" x2="400" y2="262" markerEnd="url(#arrow)" />
-      <line x1="650" y1="320" x2="650" y2="262" markerEnd="url(#arrow)" />
-    </g>
-
-    <g>
-      <rect x="80" y="320" width="140" height="60" rx="6" fill="none" stroke="currentColor" strokeWidth="1" opacity="0.85" />
-      <text x="150" y="344" textAnchor="middle">workload</text>
-      <text x="150" y="362" textAnchor="middle" opacity="0.6" fontSize="11">CI runner</text>
-
-      <rect x="330" y="320" width="140" height="60" rx="6" fill="none" stroke="currentColor" strokeWidth="1" opacity="0.85" />
-      <text x="400" y="344" textAnchor="middle">workload</text>
-      <text x="400" y="362" textAnchor="middle" opacity="0.6" fontSize="11">build container</text>
-
-      <rect x="580" y="320" width="140" height="60" rx="6" fill="none" stroke="currentColor" strokeWidth="1" opacity="0.85" />
-      <text x="650" y="344" textAnchor="middle">workload</text>
-      <text x="650" y="362" textAnchor="middle" opacity="0.6" fontSize="11">agent sandbox</text>
-    </g>
-
-  </g>
-</svg>
-
-The control plane is the single source of truth. Operators publish policies once; the control plane fans them out to every connected proxy in seconds. Each proxy enforces locally against its workload's egress and streams audit events back. New proxies enroll with a short-lived token and pick up the right policies based on the tags they carry.
+**Grants.** A grant gives one credential to a principal or a role. Each grant carries [request rules](/control-plane/api/overview#request-rules) for host, methods, and paths, so a credential is only added to the requests it is meant for.
 
 ## What You Get
 
-**Policy as the source of truth.** Allowlists, secret mappings, and transform rules live in the control plane and are versioned there. Proxies are stateless clients; rebuild a host and it pulls the current policy on reconnect. There is no per-host YAML to drift.
+**Credentials as the source of truth.** Secrets, the identities that may use them, and the requests they apply to all live in the control plane. Proxies are stateless clients. Rebuild a host and it pulls the current config on reconnect. There is no per-host YAML to drift.
 
-**Live updates, no restarts.** Publish a policy change and every connected proxy applies it within seconds. Tightening an allowlist mid-incident or rotating a secret mapping is a single API call, not a fleet-wide redeploy.
+**Live updates, no restarts.** Change a grant or rotate a secret and the next [sync](/control-plane/api/overview) delivers it. Each config carries a content hash that works like an ETag, so a proxy that already holds the current config gets an empty response and applies nothing.
 
-**Zero-config enrollment.** A proxy starts with `IRON_ENROLLMENT_TOKEN=…` and nothing else. Tokens are short-lived and single-use by default, so the same image safely boots in CI, in a sandbox, or in a long-lived VM. See [Enrollment](./enrollment) for the token model.
+**Secrets never reach the workload, or even the proxy host.** Inline values are encrypted at rest and delivered only to the assigned proxy. For external stores, only a reference travels. For [broker credentials](/control-plane/api/secrets#broker-credentials), iron-control runs the OAuth refresh loop itself and sends only the short-lived access token, so the long-lived refresh token never leaves the control plane.
 
-**Fleet-wide audit search.** Every request across every proxy lands in one queryable store, indexed by host, workload tag, destination, decision, and the secrets that were proxied in. No per-host log shipping, no Loki cluster to operate.
+**One identity, audited at the edge.** Each proxy emits a structured [audit log](/guides/otel-export) of every request, including which credential was injected. Tag those logs by principal to get a per-identity record of everything a workload did.
 
-## Deployment Options
+## Hosted Or Self-Hosted
 
-The control plane is available as a hosted cloud service and as a self-hosted on-prem instance. Both run the same software and expose the same API, UI, and proxy protocol, so moving between them is a config change rather than a rewrite.
+iron-control is available as a hosted cloud service and as a self-hosted instance you run inside your own infrastructure. Both run the same software and expose the same API, console, and proxy protocol, so moving between them is a configuration change rather than a rewrite.
 
-**Hosted.** Enroll proxies against a tenant endpoint and get policy management, live updates, enrollment, and audit search without operating anything yourself. Suited to teams that want a production-ready control plane without data-residency or network-isolation requirements.
+**Hosted.** Point proxies at a tenant endpoint and get credential management and live updates without operating anything yourself. Suited to teams that want a production-ready control plane without data-residency or network-isolation requirements.
 
-**Self-hosted.** Runs entirely inside your own infrastructure, with source available. Policy data and audit logs stay on your network, and the deployment can be fully air-gapped. Suited to regulated environments, on-prem-only networks, or any setting where a managed service is not an option.
+**Self-hosted.** iron-control is open source under Apache 2.0, published to Docker Hub as [`ironsh/iron-control`](https://hub.docker.com/r/ironsh/iron-control). It runs entirely inside your network: credentials and configuration never leave your infrastructure, and the deployment can be fully air-gapped. See [Self-Hosted](/control-plane/self-hosted) to run it.
 
 ## Next Steps
 
-[Book a demo](https://cal.com/matt-slipper-ironsh/15min) for a walkthrough of policy authoring, live updates, enrollment, and audit search against a real fleet.
+- [Connect a proxy](/control-plane/enrollment): register an iron-proxy and assign it an identity.
+- [Access model](/control-plane/policies): principals, roles, and grants in depth.
+- [Control plane API](/control-plane/api/overview): the full JSON API reference.
+
+[Book a demo](https://cal.com/matt-slipper-ironsh/15min) for a walkthrough against a real fleet.
