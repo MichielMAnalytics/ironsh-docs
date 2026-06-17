@@ -203,6 +203,7 @@ export default defineConfig({
             { text: "Enrollment", link: "/control-plane/enrollment" },
             { text: "Policies", link: "/control-plane/policies" },
             { text: "Self-Hosted", link: "/control-plane/self-hosted" },
+            { text: "Deploy With Helm", link: "/control-plane/deploy-with-helm" },
           ],
         },
       ],

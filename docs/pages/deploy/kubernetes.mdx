@@ -1,502 +1,268 @@
 ---
 title: "Deploy on Kubernetes"
-description: "Run iron-proxy as an in-cluster Deployment with a fixed ClusterIP so workload pods can route DNS and egress through it."
+description: "Install iron-proxy on Kubernetes with the official Helm chart."
 ---
 
 # Deploy on Kubernetes
 
-Run iron-proxy inside a Kubernetes cluster as a Deployment behind a Service with a fixed ClusterIP. Workload pods point their DNS at that ClusterIP, which routes lookups and TLS traffic through the proxy.
+Use the `iron-proxy` Helm chart to run iron-proxy as a Kubernetes Deployment with a Service, health probes, optional Prometheus scraping, and either standalone or control-plane managed configuration.
 
-:::info
-This layout puts iron-proxy on the pod network. It works on any conformant Kubernetes distribution, including managed offerings like GKE, EKS, and AKS. The "Preventing Circumvention" section below describes how to lock down egress with NetworkPolicies so workloads cannot bypass the proxy.
-:::
-
-## How It Works
-
-iron-proxy runs in its own namespace. A Service with a fixed ClusterIP exposes DNS on port 53 and TLS on ports 80 and 443. Workload pods set `dnsPolicy: None` and list the proxy Service IP as their nameserver. Every DNS lookup returns the proxy's IP, so every HTTP and HTTPS connection terminates at iron-proxy. The proxy then checks the request against your allowlist, swaps any tokens for their upstream values, and forwards the request.
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│ Kubernetes cluster                                           │
-│                                                              │
-│  ┌─────────────────────┐          ┌───────────────────────┐  │
-│  │ workload pod        │          │ iron-proxy pod        │  │
-│  │                     │          │                       │  │
-│  │ dnsPolicy: None     │          │  :53  DNS             │  │
-│  │ dnsConfig:          │          │  :80  HTTP            │  │
-│  │   nameservers:      │          │  :443 HTTPS MITM      │  │
-│  │   - <proxy IP>──────┼──────────┼─►                     │  │
-│  │                     │  Service │                       │  │
-│  │ curls httpbin.org ──┼──────────┼─► allowlist + secret  │  │
-│  │                     │ ClusterIP│   transforms          │  │
-│  └─────────────────────┘          └───────────┬───────────┘  │
-│                                                │             │
-│                                         allowed traffic      │
-│                                                ▼             │
-│                                           internet           │
-└──────────────────────────────────────────────────────────────┘
-```
+The chart lives in the `iron-proxy` repository under `charts/iron-proxy`.
 
 ## Prerequisites
 
-- A Kubernetes cluster with `kubectl` configured
-- An unused IP inside the cluster Service CIDR that you can reserve for iron-proxy
-- `openssl` for generating the CA certificate
+- A Kubernetes cluster with `kubectl` and `helm` configured
+- A checked-out copy of the `iron-proxy` repository
+- A stable IP address clients can use to reach the proxy, usually a pinned `ClusterIP` or `LoadBalancer` IP
+- A stable CA certificate and key if you use MITM TLS mode
 
-## Setup
+## Install In Standalone Mode
 
-::::steps
-### Create The Namespace
+Standalone mode renders `.Values.config` into a ConfigMap and starts iron-proxy with that file. This is the default mode.
 
-Everything lives in a dedicated `iron-proxy` namespace so the proxy, its config, and the example workload are easy to inspect and tear down together.
-
-```yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: iron-proxy
-```
+Generate a CA once and store it in a Secret:
 
 ```bash
-kubectl apply -f 01-namespace.yaml
-```
+iron-proxy generate-ca -outdir ./ca -name "Acme egress CA"
 
-### Generate And Load The CA
-
-iron-proxy mints a per-domain leaf certificate for each upstream host. It needs a CA certificate and private key to sign those leaves. Generate a long-lived CA and load it into the cluster as a Secret:
-
-```bash
-openssl genrsa -out ca.key 4096
-
-openssl req -x509 -new -nodes \
-  -key ca.key -sha256 -days 3650 \
-  -subj "/CN=iron-proxy CA" \
-  -addext "basicConstraints=critical,CA:TRUE" \
-  -addext "keyUsage=critical,keyCertSign" \
-  -out ca.crt
+kubectl create namespace iron-proxy
 
 kubectl -n iron-proxy create secret generic iron-proxy-ca \
-  --from-file=ca.crt=ca.crt \
-  --from-file=ca.key=ca.key
+  --from-file=ca.crt=./ca/ca.crt \
+  --from-file=ca.key=./ca/ca.key
 ```
 
-:::warning
-Keep `ca.key` out of source control. Any holder of this key can mint certificates that workloads will trust. See the [CA certificate reference](/guides/ca-certificates) for rotation guidance.
-:::
-
-### Reserve A Service IP And Create The Service
-
-Workloads need a stable DNS nameserver. Pick a free address inside your cluster Service CIDR and reserve it as the iron-proxy Service ClusterIP. The rest of this guide uses `192.168.194.130`. Replace it with an IP that fits your cluster.
+Create a `values.yaml` file:
 
 ```yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: iron-proxy
-  namespace: iron-proxy
-spec:
+mode: standalone
+
+service:
   type: ClusterIP
-  clusterIP: 192.168.194.130
-  selector:
-    app: iron-proxy
-  ports:
-    - name: dns-udp
-      port: 53
-      targetPort: dns-udp
-      protocol: UDP
-    - name: dns-tcp
-      port: 53
-      targetPort: dns-tcp
-      protocol: TCP
-    - name: http
-      port: 80
-      targetPort: http
-    - name: https
-      port: 443
-      targetPort: https
-    - name: tunnel
-      port: 8080
-      targetPort: tunnel
+  clusterIP: 10.96.10.10
+
+ca:
+  mode: existingSecret
+  existingSecret: iron-proxy-ca
+
+config:
+  dns:
+    proxy_ip: "10.96.10.10"
+    passthrough:
+      - "*.cluster.local"
+      - "*.svc"
+  tls:
+    mode: "mitm"
+    ca_cert: "/etc/iron-proxy/tls/ca.crt"
+    ca_key: "/etc/iron-proxy/tls/ca.key"
+  transforms:
+    - name: allowlist
+      config:
+        domains:
+          - "api.openai.com"
+          - "api.anthropic.com"
+  log:
+    level: "info"
 ```
+
+Install the chart from the repository checkout:
 
 ```bash
-kubectl apply -f 03-proxy-service.yaml
+helm install iron-proxy ./charts/iron-proxy \
+  --namespace iron-proxy \
+  --values values.yaml
 ```
 
-### Load The Upstream Secret
+`config.dns.proxy_ip` must match the address clients use to reach the proxy. For in-cluster DNS interception, pin `service.clusterIP` and use the same value for `config.dns.proxy_ip`.
 
-The real secret lives in a Kubernetes Secret that is mounted only on the iron-proxy pod. Workloads never see it. Create it imperatively so the value stays out of source control:
+## Install In Managed Mode
+
+Managed mode connects iron-proxy to the control plane. The proxy authenticates with a bearer token, then pulls transforms, secrets, and routing policy from the control plane. The chart does not render a `proxy.yaml` in this mode.
+
+Create a Secret with the proxy token:
 
 ```bash
-kubectl -n iron-proxy create secret generic iron-proxy-upstream-secrets \
-  --from-literal=HTTPBIN_API_KEY=real-secret-value-abc123
+kubectl -n iron-proxy create secret generic iron-proxy-token \
+  --from-literal=token="$IRON_PROXY_TOKEN"
 ```
 
-### Create The Proxy ConfigMap
-
-The ConfigMap holds the iron-proxy YAML config. `dns.proxy_ip` must match the Service ClusterIP so lookups return an address the cluster routes back to iron-proxy. `dns.passthrough` keeps in-cluster DNS names (anything under `*.cluster.local` or `*.svc`) working by forwarding them to the upstream resolver unchanged.
+Create a managed-mode `values.yaml` file:
 
 ```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: iron-proxy-config
-  namespace: iron-proxy
-data:
-  proxy.yaml: |
-    dns:
-      listen: ":53"
-      proxy_ip: "192.168.194.130"
-      passthrough:
-        - "*.cluster.local"
-        - "*.svc"
+mode: managed
 
-    proxy:
-      http_listen: ":80"
-      https_listen: ":443"
-      tunnel_listen: ":8080"
-      max_request_body_bytes: 1048576
+service:
+  type: ClusterIP
+  clusterIP: 10.96.10.10
 
-    tls:
-      ca_cert: "/etc/iron-proxy/ca.crt"
-      ca_key: "/etc/iron-proxy/ca.key"
-      cert_cache_size: 1000
-      leaf_cert_expiry_hours: 72
+managed:
+  existingTokenSecret: iron-proxy-token
+  tokenSecretKey: token
+  controlPlaneURL: https://api.iron.sh
+  proxyIP: "10.96.10.10"
+  logLevel: info
 
-    transforms:
-      - name: allowlist
-        config:
-          domains:
-            - "httpbin.org"
-
-      - name: secrets
-        config:
-          secrets:
-            - source:
-                type: env
-                var: HTTPBIN_API_KEY
-              proxy_value: "proxy-httpbin-token"
-              match_headers: ["Authorization"]
-              require: true
-              rules:
-                - host: "httpbin.org"
-
-    log:
-      level: "info"
+ca:
+  mode: existingSecret
+  existingSecret: iron-proxy-ca
 ```
+
+Install or upgrade:
 
 ```bash
-kubectl apply -f 05-proxy-config.yaml
+helm upgrade --install iron-proxy ./charts/iron-proxy \
+  --namespace iron-proxy \
+  --values values.yaml
 ```
 
-This config does two things:
+Use `managed.controlPlaneURL` when the proxy should talk to a self-hosted [iron-control](/control-plane/deploy-with-helm) instance instead of the hosted control plane.
 
-1. **`allowlist`** blocks every host except `httpbin.org`. Add the domains your workloads actually need.
-2. **`secrets`** swaps the placeholder token `proxy-httpbin-token` in the `Authorization` header for the real value of `HTTPBIN_API_KEY`, but only for requests to `httpbin.org`. The workload never holds the real secret.
+## Listener Ports
 
-See the [configuration reference](/reference/configuration) for the full set of transforms and options.
-
-### Deploy iron-proxy
-
-The Deployment runs iron-proxy with the ConfigMap mounted as its config file, the CA Secret mounted at `/etc/iron-proxy/ca.crt` and `/etc/iron-proxy/ca.key`, and the upstream Secret injected as environment variables. The Service load-balances across every pod that matches the selector, so running multiple replicas is a drop-in change: bump `replicas` and let the RollingUpdate strategy keep at least one pod serving traffic during config changes. All replicas share the same CA, ConfigMap, and upstream Secret, so behavior is identical across pods. Each replica does maintain its own in-memory leaf-cert cache, which means a small amount of duplicate signing work when the same upstream hits different pods.
+The `listeners` block is the single source of truth for ports. Each enabled listener is exposed on the Service, exposed as a container port, and passed to iron-proxy as a bind address.
 
 ```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: iron-proxy
-  namespace: iron-proxy
-  labels:
-    app: iron-proxy
-spec:
-  replicas: 2
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
-  selector:
-    matchLabels:
-      app: iron-proxy
-  template:
-    metadata:
-      labels:
-        app: iron-proxy
-    spec:
-      containers:
-        - name: iron-proxy
-          image: ironsh/iron-proxy:latest
-          args: ["-config", "/etc/iron-proxy/proxy.yaml"]
-          ports:
-            - name: dns-udp
-              containerPort: 53
-              protocol: UDP
-            - name: dns-tcp
-              containerPort: 53
-              protocol: TCP
-            - name: http
-              containerPort: 80
-            - name: https
-              containerPort: 443
-            - name: tunnel
-              containerPort: 8080
-          envFrom:
-            - secretRef:
-                name: iron-proxy-upstream-secrets
-          volumeMounts:
-            - name: config
-              mountPath: /etc/iron-proxy/proxy.yaml
-              subPath: proxy.yaml
-              readOnly: true
-            - name: ca
-              mountPath: /etc/iron-proxy/ca.crt
-              subPath: ca.crt
-              readOnly: true
-            - name: ca
-              mountPath: /etc/iron-proxy/ca.key
-              subPath: ca.key
-              readOnly: true
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 1000m
-              memory: 512Mi
-      volumes:
-        - name: config
-          configMap:
-            name: iron-proxy-config
-        - name: ca
-          secret:
-            secretName: iron-proxy-ca
+listeners:
+  dns:
+    enabled: true
+    port: 53
+    protocol: UDP
+  http:
+    enabled: true
+    port: 80
+    protocol: TCP
+  https:
+    enabled: true
+    port: 443
+    protocol: TCP
+  metrics:
+    enabled: true
+    port: 9090
+    protocol: TCP
+  tunnel:
+    enabled: true
+    port: 8080
+    protocol: TCP
+  postgres:
+    enabled: false
+    port: 5432
+    protocol: TCP
+  management:
+    enabled: false
+    port: 9092
+    protocol: TCP
 ```
 
-```bash
-kubectl apply -f 06-proxy-deployment.yaml
-kubectl -n iron-proxy rollout status deploy/iron-proxy
-```
+Disable `listeners.dns.enabled` when clients use explicit `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` settings instead of DNS interception. When DNS is disabled, `proxy_ip` is not required.
 
-### Run A Test Workload
+The container runs as non-root and uses `NET_BIND_SERVICE` so it can bind ports 53, 80, and 443. If your cluster policy forbids that capability, move the listeners to ports above 1024.
 
-The test workload curls `httpbin.org` every few seconds using a placeholder token in the `Authorization` header. iron-proxy swaps the token for the real key before forwarding. `httpbin.org` echoes request headers back, so the workload log shows the swapped value. A second curl to `example.com` confirms that non-allowlisted hosts get blocked.
+## CA Modes
 
-`dnsPolicy: None` plus `dnsConfig.nameservers` points the workload at the proxy Service IP. Mounting `ca.crt` lets curl trust the leaf certificate iron-proxy mints for `httpbin.org`.
+MITM mode requires a CA certificate and private key. Clients must trust the CA certificate.
+
+| Value | Behavior | Use When |
+| --- | --- | --- |
+| `ca.mode: existingSecret` | Mounts a Secret you created. | Production. This is the default. |
+| `ca.mode: inline` | Creates a Secret from `ca.cert` and `ca.key`. | GitOps with encrypted values. |
+| `ca.mode: none` | Mounts no CA. | SNI-only mode or a config that points elsewhere. |
+
+For SNI-only mode:
 
 ```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: iron-proxy-workload-tokens
-  namespace: iron-proxy
-data:
-  HTTPBIN_PROXY_TOKEN: proxy-httpbin-token
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: iron-proxy-workload
-  namespace: iron-proxy
-  labels:
-    app: iron-proxy-workload
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: iron-proxy-workload
-  template:
-    metadata:
-      labels:
-        app: iron-proxy-workload
-    spec:
-      dnsPolicy: None
-      dnsConfig:
-        nameservers:
-          - 192.168.194.130
-      containers:
-        - name: workload
-          image: curlimages/curl:8.10.1
-          envFrom:
-            - configMapRef:
-                name: iron-proxy-workload-tokens
-          env:
-            - name: SLEEP_SECONDS
-              value: "5"
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -u
-              while true; do
-                echo "--- httpbin /headers (expect swapped Authorization) ---"
-                curl --fail-with-body -sS \
-                  --cacert /etc/iron-proxy/ca.crt \
-                  -H "Authorization: Bearer ${HTTPBIN_PROXY_TOKEN}" \
-                  https://httpbin.org/headers || true
-
-                echo
-                echo "--- blocked destination (expect 403 from iron-proxy) ---"
-                curl -sS -o /dev/null -w "status=%{http_code}\n" \
-                  --cacert /etc/iron-proxy/ca.crt \
-                  https://example.com/ || true
-
-                sleep "${SLEEP_SECONDS}"
-              done
-          volumeMounts:
-            - name: ca
-              mountPath: /etc/iron-proxy/ca.crt
-              subPath: ca.crt
-              readOnly: true
-      volumes:
-        - name: ca
-          secret:
-            secretName: iron-proxy-ca
-            items:
-              - key: ca.crt
-                path: ca.crt
+ca:
+  mode: none
+config:
+  tls:
+    mode: "sni-only"
 ```
 
-```bash
-kubectl apply -f 07-workload-deployment.yaml
-```
+Managed mode uses `managed.tlsMode: sni-only` instead of `config.tls.mode`.
 
-### Verify
+## Secrets And Cloud Identity
 
-Tail the workload log. The response body from `httpbin.org/headers` should show `Authorization: Bearer real-secret-value-abc123`, confirming iron-proxy swapped the placeholder for the real secret. The second curl to `example.com` should return `status=403`.
+Use standard Kubernetes Secret and identity mechanisms for credentials that iron-proxy needs at runtime:
 
-```bash
-kubectl -n iron-proxy logs -f deploy/iron-proxy-workload
-```
+- `env` or `envFrom` for Secrets and ConfigMaps you manage
+- `secretEnv` for small demo secrets managed by the chart
+- `extraVolumes` and `extraVolumeMounts` for file-backed secrets, gRPC client certificates, and GCP keyfiles
+- `serviceAccount.annotations` for EKS IRSA or GKE Workload Identity
 
-Then tail the proxy log for the audit record:
-
-```bash
-kubectl -n iron-proxy logs -f deploy/iron-proxy
-```
-
-Each request produces a JSON entry like:
-
-```json
-{
-  "host": "httpbin.org",
-  "method": "GET",
-  "path": "/headers",
-  "action": "allow",
-  "status_code": 200,
-  "duration_ms": 142,
-  "request_transforms": [
-    { "name": "allowlist", "action": "allow" },
-    { "name": "secrets", "action": "replace" }
-  ]
-}
-```
-
-::::
-
-## Rolling Out
-
-Start in warn mode so traffic keeps flowing while you discover what your workloads actually need. Add `warn: true` to the allowlist transform, roll out the ConfigMap, and watch the audit log for denied requests. Once the allowlist covers every domain you see, remove `warn: true` (or set it to `false`) to switch to enforce mode.
+Example:
 
 ```yaml
-transforms:
-  - name: allowlist
-    config:
-      warn: true
-      domains:
-        - "httpbin.org"
+env:
+  - name: OPENAI_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: upstream-api-keys
+        key: openai
+
+config:
+  transforms:
+    - name: secrets
+      config:
+        secrets:
+          - source:
+              type: env
+              var: OPENAI_API_KEY
+            inject:
+              header: Authorization
+              formatter: "Bearer {{ .Value }}"
+            rules:
+              - host: api.openai.com
 ```
 
-Apply the change with `kubectl apply -f 05-proxy-config.yaml` and restart the proxy so it picks up the new config:
+## Metrics
 
-```bash
-kubectl -n iron-proxy rollout restart deploy/iron-proxy
-```
-
-## Preventing Circumvention
-
-:::warning
-This section is strongly recommended. Without it, a workload can skip DNS and connect to an external IP address directly, bypassing the proxy.
-:::
-
-Use a NetworkPolicy to restrict egress from workload pods so they can only reach iron-proxy. Apply this policy in the namespace where your workloads run:
+The metrics listener is enabled by default on port `9090`. To create a Prometheus Operator `ServiceMonitor`, enable:
 
 ```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: workload-egress-via-iron-proxy
-  namespace: iron-proxy
-spec:
-  podSelector:
-    matchLabels:
-      app: iron-proxy-workload
-  policyTypes:
-    - Egress
-  egress:
-    - to:
-        - podSelector:
-            matchLabels:
-              app: iron-proxy
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
-        - protocol: TCP
-          port: 80
-        - protocol: TCP
-          port: 443
-        - protocol: TCP
-          port: 8080
+metrics:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: prometheus
 ```
 
-This requires a CNI that enforces NetworkPolicies. Calico, Cilium, and most managed offerings qualify.
+## Verify The Release
 
-## Updating The Config
-
-Edit the ConfigMap, apply it, and restart the proxy to pick up the new config:
+Check the rendered manifests before installing:
 
 ```bash
-kubectl apply -f 05-proxy-config.yaml
-kubectl -n iron-proxy rollout restart deploy/iron-proxy
+helm lint ./charts/iron-proxy
+
+helm template iron-proxy ./charts/iron-proxy \
+  --namespace iron-proxy \
+  --values values.yaml
 ```
 
-With `replicas: 2` and `maxUnavailable: 0`, Kubernetes keeps at least one pod serving traffic throughout the rollout. Scale to more replicas if you need headroom.
-
-## Trusting The CA
-
-Workload pods need to trust iron-proxy's CA. The simplest approach is to mount the `iron-proxy-ca` Secret (the `ca.crt` key only) and point your runtime at it:
-
-| Runtime | Environment Variable Or Flag |
-| --- | --- |
-| curl | `--cacert /etc/iron-proxy/ca.crt` |
-| Most languages | `SSL_CERT_FILE=/etc/iron-proxy/ca.crt` |
-| Node.js | `NODE_EXTRA_CA_CERTS=/etc/iron-proxy/ca.crt` |
-| Python (requests) | `REQUESTS_CA_BUNDLE=/etc/iron-proxy/ca.crt` |
-
-If you control the workload image, you can also bake the CA into the system trust store at image build time. See the [CA certificate reference](/guides/ca-certificates) for per-runtime details.
-
-## Troubleshooting
-
-### Workloads Get "Connection Refused" or DNS Timeouts
-
-Check that the Service ClusterIP in `03-proxy-service.yaml` matches `dns.proxy_ip` in the ConfigMap. The two values must be identical. If you picked an IP that is already in use, `kubectl apply` on the Service fails with `clusterIP is already allocated`. Pick a different IP and update both files.
-
-### iron-proxy Pod Crashes With "Permission Denied" on Port 53
-
-Some Kubernetes distributions restrict binding to privileged ports (below 1024) inside containers. If this hits you, either set `securityContext.capabilities.add: ["NET_BIND_SERVICE"]` on the container or move the DNS listener to a high port and adjust `dnsConfig` on workloads accordingly.
-
-### Upstream TLS Errors (x509)
-
-iron-proxy verifies upstream server certificates against its system CA bundle. If the upstream chain includes a root not present in iron-proxy's image, requests fail with `certificate signed by unknown authority`. Add the missing root CA to the iron-proxy image or a volume-mounted bundle.
-
-### In-Cluster DNS Broken for Workload Pods
-
-`dns.passthrough` in the ConfigMap must include the suffixes used by your cluster's service DNS. The defaults (`*.cluster.local` and `*.svc`) cover kube-dns and CoreDNS out of the box. If you use a custom cluster domain, add it to `passthrough`.
-
-### Secret Swap Not Happening
-
-If `httpbin.org` echoes back the placeholder token instead of the real secret, check that `HTTPBIN_API_KEY` is set on the iron-proxy pod and that the `Authorization` header in the outbound request exactly matches the placeholder. The secrets transform is literal, not a substring match. Inspect the pod env with:
+After installing, check the Service and health endpoint:
 
 ```bash
-kubectl -n iron-proxy exec deploy/iron-proxy -- env | grep HTTPBIN
+kubectl -n iron-proxy get svc iron-proxy
+
+kubectl -n iron-proxy port-forward svc/iron-proxy 9090:9090
+curl http://localhost:9090/healthz
 ```
+
+## Important Values
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `mode` | `standalone` | `standalone` or `managed`. |
+| `replicaCount` | `1` | Number of proxy replicas. Use a shared Service IP and identical stateless config when scaling. |
+| `image.repository` | `ironsh/iron-proxy` | Container image repository. |
+| `image.tag` | chart app version | Container image tag. Pin a released version for production. |
+| `config` | sample config | Standalone-mode iron-proxy config rendered into `proxy.yaml`. |
+| `configExistingConfigMap` | `""` | Existing ConfigMap with a `proxy.yaml` key. |
+| `managed.existingTokenSecret` | `""` | Existing Secret that holds the proxy token. |
+| `managed.proxyIP` | `""` | Required in managed mode when DNS is enabled. Sets `IRON_DNS_PROXY_IP`. |
+| `ca.mode` | `existingSecret` | `existingSecret`, `inline`, or `none`. |
+| `ca.existingSecret` | `""` | Secret with `ca.crt` and `ca.key`. Required for `existingSecret` mode. |
+| `service.type` | `ClusterIP` | Kubernetes Service type. |
+| `service.clusterIP` | `""` | Static ClusterIP. Usually matches `proxy_ip`. |
+| `listeners.*` | varies | Enabled state, port, and protocol for each listener. |
+| `serviceAccount.annotations` | `{}` | Cloud identity annotations for secret backends. |
+| `resources` | `{}` | Pod resource requests and limits. |
+| `metrics.serviceMonitor.enabled` | `false` | Create a Prometheus Operator `ServiceMonitor`. |
