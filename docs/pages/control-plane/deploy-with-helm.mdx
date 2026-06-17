@@ -1,0 +1,272 @@
+---
+title: "Deploy With Helm"
+description: "Install the self-hosted iron-control control plane on Kubernetes with the Helm chart."
+---
+
+# Deploy With Helm
+
+Use the `iron-control` Helm chart to run the self-hosted control plane on Kubernetes. The chart creates separate web and background job Deployments, a web Service, an optional Ingress, and a pre-install or pre-upgrade migration Job.
+
+The chart lives in the `iron-control` repository under `charts/iron-control`.
+
+## Architecture
+
+The chart creates three workloads:
+
+| Workload | Resource | Purpose |
+| --- | --- | --- |
+| `web` | Deployment | Runs the Rails web server through Thruster and serves the console and API. |
+| `jobs` | Deployment | Runs Solid Queue workers and the recurring job scheduler. |
+| `migrate` | Helm hook Job | Runs `rails db:prepare` before install and upgrade. |
+
+PostgreSQL is the only external dependency. The app uses Solid Queue, Solid Cache, and Solid Cable, so Redis is not required.
+
+## Prerequisites
+
+- A Kubernetes cluster with `kubectl` and `helm` configured
+- A checked-out copy of the `iron-control` repository
+- The `iron-control` container image in a registry your cluster can pull from
+- PostgreSQL 14 or newer reachable from the cluster
+- A Kubernetes Secret with the Rails, database, and encryption secrets
+
+The app expects four databases owned by the `iron_control` role:
+
+- `iron_control_production`
+- `iron_control_production_cache`
+- `iron_control_production_queue`
+- `iron_control_production_cable`
+
+The migration Job can create these databases if the `iron_control` role has `CREATEDB`.
+
+## Create The Secret
+
+For production, create the Secret yourself or with an external-secrets operator. The chart reads these keys from `secrets.existingSecret`:
+
+| Key | Purpose |
+| --- | --- |
+| `RAILS_MASTER_KEY` | Rails credentials encryption. |
+| `IRON_CONTROL_DATABASE_PASSWORD` | Password for the `iron_control` Postgres role. |
+| `IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY` | ActiveRecord encryption primary key. |
+| `IRON_CONTROL_AR_ENCRYPTION_DETERMINISTIC_KEY` | ActiveRecord encryption deterministic key. |
+| `IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT` | ActiveRecord encryption key derivation salt. |
+
+Optional first-boot keys can be added to the same Secret:
+
+| Key | Purpose |
+| --- | --- |
+| `IRON_CONTROL_INITIAL_USER_EMAIL` | Email for the initial user. |
+| `IRON_CONTROL_INITIAL_USER_PASSWORD` | Password for the initial user. Must be at least 12 characters. |
+| `IRON_CONTROL_INITIAL_API_KEY` | Optional plaintext API key. Must match the `iak_` format. |
+
+Example:
+
+```bash
+kubectl create namespace iron-control
+
+kubectl -n iron-control create secret generic iron-control-secrets \
+  --from-literal=RAILS_MASTER_KEY="$RAILS_MASTER_KEY" \
+  --from-literal=IRON_CONTROL_DATABASE_PASSWORD="$IRON_CONTROL_DATABASE_PASSWORD" \
+  --from-literal=IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY="$IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY" \
+  --from-literal=IRON_CONTROL_AR_ENCRYPTION_DETERMINISTIC_KEY="$IRON_CONTROL_AR_ENCRYPTION_DETERMINISTIC_KEY" \
+  --from-literal=IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT="$IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT" \
+  --from-literal=IRON_CONTROL_INITIAL_USER_EMAIL="admin@example.com" \
+  --from-literal=IRON_CONTROL_INITIAL_USER_PASSWORD="$IRON_CONTROL_INITIAL_USER_PASSWORD"
+```
+
+Generate ActiveRecord encryption keys with:
+
+```bash
+bin/rails db:encryption:init
+```
+
+Keep these values stable. Rotating them makes existing encrypted secret data unreadable unless you perform a planned Rails key rotation.
+
+## Install The Chart
+
+Create a `values.yaml` file:
+
+```yaml
+image:
+  repository: ghcr.io/ironsh/iron-control
+  tag: v1.2.3
+
+database:
+  host: postgres.example.internal
+  port: 5432
+
+secrets:
+  existingSecret: iron-control-secrets
+
+web:
+  replicas: 2
+
+jobs:
+  replicas: 1
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: control.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: iron-control-tls
+      hosts:
+        - control.example.com
+```
+
+Install from the repository checkout:
+
+```bash
+helm install iron-control ./charts/iron-control \
+  --namespace iron-control \
+  --values values.yaml
+```
+
+For upgrades:
+
+```bash
+helm upgrade iron-control ./charts/iron-control \
+  --namespace iron-control \
+  --values values.yaml
+```
+
+The migration Job runs before each install and upgrade when `migrations.enabled` is `true`.
+
+## Inline Secrets
+
+If `secrets.existingSecret` is empty, the chart creates a Secret from `secrets.values.*`.
+
+```yaml
+secrets:
+  values:
+    railsMasterKey: ""
+    databasePassword: ""
+    arEncryptionPrimaryKey: ""
+    arEncryptionDeterministicKey: ""
+    arEncryptionKeyDerivationSalt: ""
+
+bootstrap:
+  initialUserEmail: admin@example.com
+  initialUserPassword: "change-this-long-password"
+  initialApiKey: ""
+```
+
+Use this only for evaluation. Inline values are stored in Helm release history, and the chart-managed Secret is hook-annotated so Helm does not remove it on uninstall.
+
+## Configure Web And Jobs
+
+The web Deployment serves `/up` for startup, readiness, and liveness probes. The jobs Deployment runs `bin/jobs` with a `Recreate` strategy so a rollout does not briefly double scheduler capacity.
+
+```yaml
+config:
+  logLevel: info
+  webConcurrency: 1
+  railsMaxThreads: 3
+  jobConcurrency: 1
+
+web:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+
+jobs:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+```
+
+Do not set `IRON_CONTROL_SOLID_QUEUE_IN_PUMA` with `extraEnv`. The chart runs jobs in a dedicated Deployment.
+
+## Expose The Console
+
+Use an Ingress for normal operation:
+
+```yaml
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+  hosts:
+    - host: control.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: iron-control-tls
+      hosts:
+        - control.example.com
+```
+
+For local access without Ingress:
+
+```bash
+kubectl -n iron-control port-forward svc/iron-control-web 8080:80
+```
+
+Then open `http://localhost:8080`.
+
+## Verify The Release
+
+Render the chart before installing:
+
+```bash
+helm lint ./charts/iron-control
+
+helm template iron-control ./charts/iron-control \
+  --namespace iron-control \
+  --set image.repository=ghcr.io/ironsh/iron-control \
+  --set database.host=postgres.example.internal \
+  --set secrets.existingSecret=iron-control-secrets
+```
+
+After installing:
+
+```bash
+kubectl -n iron-control get jobs,pods,svc,ingress
+
+kubectl -n iron-control logs job/iron-control-migrate
+
+kubectl -n iron-control rollout status deploy/iron-control-web
+kubectl -n iron-control rollout status deploy/iron-control-jobs
+```
+
+If the migration Job fails, inspect its logs before retrying. Failed hook Jobs are kept for debugging and replaced on the next Helm attempt.
+
+## Important Values
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `image.repository` | `""` | Required image repository. |
+| `image.tag` | chart app version | Container image tag. |
+| `database.host` | `""` | Required Postgres hostname. |
+| `database.port` | `5432` | Postgres port. |
+| `secrets.existingSecret` | `""` | Existing Secret with required keys. Recommended for production. |
+| `secrets.values.*` | `""` | Inline secrets used only when `existingSecret` is unset. |
+| `bootstrap.*` | `""` | Optional first-boot user and API key for chart-managed Secrets. |
+| `config.logLevel` | `info` | Rails log level. |
+| `config.webConcurrency` | `1` | Puma worker process count. |
+| `config.railsMaxThreads` | `3` | Puma threads and ActiveRecord pool size. |
+| `config.jobConcurrency` | `1` | Solid Queue worker process count. |
+| `web.replicas` | `2` | Web pod count. |
+| `jobs.replicas` | `1` | Jobs pod count. More than one is safe but rarely needed. |
+| `migrations.enabled` | `true` | Run `rails db:prepare` as a Helm hook Job. |
+| `service.type` | `ClusterIP` | Web Service type. |
+| `service.port` | `80` | Web Service port. |
+| `ingress.enabled` | `false` | Create an Ingress. |
+| `extraEnv` and `extraEnvFrom` | `[]` | Environment additions for all workloads. |
+| `web.extraEnv` and `jobs.extraEnv` | `[]` | Environment additions for one workload. |
+| `serviceAccount.*` | created | ServiceAccount settings for web and jobs pods. |
+| `podSecurityContext` | non-root | Pod security context. |
+| `containerSecurityContext` | no capabilities | Container security context. |

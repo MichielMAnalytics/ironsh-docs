@@ -7,7 +7,7 @@ description: "Run the iron-proxy control plane inside your own infrastructure."
 
 The control plane runs inside your own network with the same software, API, and proxy protocol as the hosted version. Policy data, enrollment tokens, and audit logs never leave your infrastructure, and the deployment can be fully air-gapped. Source is available.
 
-A complete deployment bundle (container images, manifests, and an installation guide) is available on request. The page below covers the system requirements so you can size the host before reaching out.
+For Kubernetes installs, use the [iron-control Helm chart](/control-plane/deploy-with-helm). The page below covers the system requirements so you can size the deployment before installing.
 
 ## System Requirements
 
@@ -23,6 +23,6 @@ The control plane is a single Docker container plus a database. There are no oth
 
 **TLS.** A certificate the proxies and operators can validate. Bring your own cert and key, or terminate at an ingress.
 
-## Get the Deployment Bundle
+## Install
 
-The self-hosted bundle ships under a source-available license with a short evaluation agreement. [Get in touch](https://cal.com/matt-slipper-ironsh/15min) and we'll walk through requirements, send the bundle, and stay on for the first install.
+Use the [Helm install guide](/control-plane/deploy-with-helm) for the chart values, required Secrets, Postgres setup, and verification steps.
