@@ -189,6 +189,7 @@ export default defineConfig({
         { text: "GitHub Actions", link: "/deploy/github-actions" },
         { text: "Daytona", link: "/deploy/daytona" },
         { text: "Freestyle", link: "/deploy/freestyle" },
+        { text: "boxd", link: "/deploy/boxd" },
       ],
     },
     {

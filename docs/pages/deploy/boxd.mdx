@@ -1,0 +1,472 @@
+---
+title: "Deploy on boxd"
+description: "Run iron-proxy inside boxd machines using a snapshot with iron-proxy pre-installed for repeatable egress control."
+---
+
+# Deploy on boxd
+
+Run iron-proxy inside [boxd](https://boxd.sh?ref=docs) machines. You set up one machine with iron-proxy, save it as a snapshot, then create machines from that snapshot with egress control already running. A boxd machine is a full Ubuntu VM with systemd and iptables, so this follows the [embedded in a VM or sandbox](/deploy/overview#embedded-in-a-vm-or-sandbox) pattern.
+
+## How It Works
+
+The setup has two phases:
+
+1. **Snapshot creation:** A one-time script creates a boxd machine, installs iron-proxy as a systemd service, generates a CA certificate, trusts it system-wide, creates an unprivileged `app` user, and adds iptables rules that send DNS from non-root processes to iron-proxy and reject their direct egress. boxd snapshots the machine's disk and memory.
+2. **Machine launch:** New machines start from the snapshot with iron-proxy already running. DNS lookups from workloads resolve to iron-proxy, which checks them against your allowlist and terminates TLS using per-domain leaf certificates. iptables rules prevent workloads from bypassing the proxy.
+
+Workloads need no proxy settings or custom environment variables. A oneshot systemd unit applies the iptables rules on every boot, so the setup also survives a reboot.
+
+## Prerequisites
+
+- A [boxd](https://boxd.sh?ref=docs) account and an API key (`boxd auth keys create <name>`, see [API keys](https://docs.boxd.sh/cli/authentication?ref=docs#api-keys))
+- Node.js 20+
+- A `BOXD_API_KEY` environment variable set in your shell. To create the machines in an organization, also set `BOXD_ORG`
+- Optionally `BOXD_REGION` (`fra` or `nyc`). Create the snapshot and the machines from it in the same region
+
+## Setup
+
+::::steps
+### Install the boxd SDK
+
+```bash
+npm install @boxd-sh/sdk
+```
+
+### Create the Snapshot Script
+
+Save this as `create-snapshot.mjs`. It creates a machine, installs iron-proxy, generates a trusted CA, locks down egress, and snapshots the result.
+
+```javascript
+import { Boxd } from "@boxd-sh/sdk";
+
+const IRON_PROXY_VERSION = process.env.IRON_PROXY_VERSION || "latest";
+const MACHINE_NAME = process.env.MACHINE_NAME || "iron-proxy-base";
+const SNAPSHOT_NAME = process.env.SNAPSHOT_NAME || "iron-proxy";
+
+// iron-proxy configuration
+const ironProxyConfig = `
+dns:
+  listen: ":53"
+  proxy_ip: "127.0.0.1"
+proxy:
+  http_listen: ":80"
+  https_listen: ":443"
+tls:
+  ca_cert: "/etc/iron-proxy/ca.crt"
+  ca_key: "/etc/iron-proxy/ca.key"
+transforms:
+  - name: allowlist
+    config:
+      warn: false
+      domains:
+        - "api.github.com"
+        - "httpbin.org"
+log:
+  level: "info"
+`.trimStart();
+
+// Runs as root once: install iron-proxy, generate and trust a CA, install the
+// systemd units, create an unprivileged user, and lock down egress.
+const installScript = `#!/bin/bash
+set -euo pipefail
+
+# Resolve version
+VERSION="${IRON_PROXY_VERSION}"
+if [ "$VERSION" = "latest" ]; then
+  VERSION=$(curl -fsSL https://api.github.com/repos/ironsh/iron-proxy/releases/latest | jq -r '.tag_name | ltrimstr("v")')
+fi
+echo "Installing iron-proxy v$VERSION"
+
+# Download, verify and install the binary
+ARCHIVE="iron-proxy_\${VERSION}_linux_amd64.tar.gz"
+BASE="https://github.com/ironsh/iron-proxy/releases/download/v\${VERSION}"
+cd /tmp
+curl -fsSL -o "$ARCHIVE" "$BASE/$ARCHIVE"
+curl -fsSL -o checksums.txt "$BASE/checksums.txt"
+grep " $ARCHIVE\\$" checksums.txt | sha256sum -c -
+tar -xzf "$ARCHIVE" iron-proxy
+install -m 755 iron-proxy /usr/local/bin/iron-proxy
+rm -f "$ARCHIVE" checksums.txt iron-proxy
+
+mkdir -p /etc/iron-proxy
+mv /tmp/iron-proxy.yaml /etc/iron-proxy/config.yaml
+
+# Generate a CA for TLS interception and trust it system-wide
+openssl genrsa -out /etc/iron-proxy/ca.key 2048 2>/dev/null
+openssl req -x509 -new -nodes \\
+  -key /etc/iron-proxy/ca.key \\
+  -sha256 -days 365 \\
+  -subj "/CN=iron-proxy CA" \\
+  -addext "basicConstraints=critical,CA:TRUE" \\
+  -addext "keyUsage=critical,keyCertSign" \\
+  -out /etc/iron-proxy/ca.crt 2>/dev/null
+chmod 600 /etc/iron-proxy/ca.key
+cp /etc/iron-proxy/ca.crt /usr/local/share/ca-certificates/iron-proxy-ca.crt
+update-ca-certificates
+cat >> /etc/environment <<'ENV'
+NODE_EXTRA_CA_CERTS=/etc/iron-proxy/ca.crt
+SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+ENV
+
+# iron-proxy runs as root under systemd
+cat > /etc/systemd/system/iron-proxy.service <<'UNIT'
+[Unit]
+Description=iron-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/iron-proxy -config /etc/iron-proxy/config.yaml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+# Send DNS from non-root processes to iron-proxy and block their direct
+# egress. A oneshot unit applies the rules on every boot.
+cat > /usr/local/sbin/iron-proxy-egress <<'SH'
+#!/bin/sh
+set -e
+nat() { iptables -t nat -C OUTPUT "$@" 2>/dev/null || iptables -t nat -A OUTPUT "$@"; }
+add() { iptables -C OUTPUT "$@" 2>/dev/null || iptables -A OUTPUT "$@"; }
+nat -p udp --dport 53 -m owner ! --uid-owner root -j REDIRECT --to-ports 53
+nat -p tcp --dport 53 -m owner ! --uid-owner root -j REDIRECT --to-ports 53
+add -o lo -j ACCEPT
+add -m owner --uid-owner root -j ACCEPT
+add -m conntrack --ctstate DNAT -j ACCEPT
+add -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+add -j REJECT --reject-with icmp-port-unreachable
+SH
+chmod 755 /usr/local/sbin/iron-proxy-egress
+
+cat > /etc/systemd/system/iron-proxy-egress.service <<'UNIT'
+[Unit]
+Description=Route egress through iron-proxy
+After=iron-proxy.service
+Wants=iron-proxy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/local/sbin/iron-proxy-egress
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now iron-proxy.service
+systemctl enable --now iron-proxy-egress.service
+
+# Unprivileged user for workloads. It has no sudo access: root traffic is
+# allowed out directly, so anything running as root bypasses the proxy.
+id app >/dev/null 2>&1 || useradd -m -s /bin/bash app
+`;
+
+async function main() {
+  const boxd = new Boxd(); // reads BOXD_API_KEY
+
+  console.log(`Creating machine ${MACHINE_NAME}...`);
+  const machine = await boxd.machines.create({
+    name: MACHINE_NAME,
+    org: process.env.BOXD_ORG,
+    isolated: true,
+  });
+  await boxd.machines.waitUntilReady(machine.id);
+
+  await boxd.machines.files.upload(machine.id, "/tmp/iron-proxy.yaml", ironProxyConfig);
+  await boxd.machines.files.upload(machine.id, "/tmp/install-iron-proxy.sh", installScript);
+
+  const install = await boxd.machines.exec(machine.id, {
+    command: "sudo bash /tmp/install-iron-proxy.sh",
+    timeout: 300_000,
+  });
+  console.log(install.stdout);
+  if (!install.success) {
+    console.error(install.stderr);
+    throw new Error(`install failed with exit code ${install.exitCode}`);
+  }
+
+  // Verify everything is running
+  const status = await boxd.machines.exec(machine.id, {
+    command: "systemctl status iron-proxy --no-pager",
+  });
+  console.log("iron-proxy service status:");
+  console.log(status.stdout);
+
+  const dns = await boxd.machines.exec(machine.id, { command: "sudo -u app getent hosts httpbin.org" });
+  console.log("DNS for the app user:");
+  console.log(dns.stdout);
+
+  // Capture memory and disk, then wait until this version is ready
+  const created = await boxd.snapshots.create(machine.id, SNAPSHOT_NAME);
+  let snapshot;
+  do {
+    await new Promise((r) => setTimeout(r, 2000));
+    snapshot = await boxd.snapshots.get(SNAPSHOT_NAME, { org: process.env.BOXD_ORG });
+    if (snapshot.status === "failed") throw new Error("snapshot failed");
+  } while (snapshot.version !== created.version);
+
+  // Keep the base machine for later changes; hibernated, it costs almost nothing
+  await boxd.machines.hibernate(machine.id);
+
+  console.log(`Snapshot: ${SNAPSHOT_NAME} (version ${snapshot.version})`);
+  console.log("Done. Create machines from this snapshot to get iron-proxy pre-configured.");
+  await boxd.close();
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+```
+
+A few things to note about this script:
+
+- **`isolated: true`** keeps the machine off your organization's private network and leaves no boxd credentials inside it. Machines created from the snapshot inherit it.
+- **`dns.proxy_ip`** is set to `127.0.0.1` because iron-proxy runs inside the same machine as your workloads.
+- **No `dns.upstream_resolver`** is set. iron-proxy runs as root, so its own lookups go to the machine's resolver from `/etc/resolv.conf`, which the script leaves unchanged.
+- **`warn: false`** means non-allowlisted requests are blocked immediately. Set to `true` while building your allowlist.
+- **`domains`** includes `api.github.com` and `httpbin.org` for testing. Replace these with the domains your workloads need before creating the snapshot.
+- The CA is trusted system-wide via `update-ca-certificates`, and `/etc/environment` points Node.js and Python at it.
+- An `app` user is created for running untrusted code. This is required because the iptables rules allow outbound traffic from root. The default `boxd` user has passwordless sudo, so do not run untrusted code as `boxd`.
+- The base machine is hibernated at the end. Keep it to change the setup later, or delete it.
+
+### Bootstrap the Snapshot
+
+Run the script to create your snapshot:
+
+```bash
+export BOXD_API_KEY="your-api-key"
+node create-snapshot.mjs
+```
+
+You should see output like this:
+
+```
+Creating machine iron-proxy-base...
+Installing iron-proxy v0.56.0
+iron-proxy_0.56.0_linux_amd64.tar.gz: OK
+Updating certificates in /etc/ssl/certs...
+2 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+done.
+
+iron-proxy service status:
+● iron-proxy.service - iron-proxy
+     Loaded: loaded (/etc/systemd/system/iron-proxy.service; enabled; preset: enabled)
+     Active: active (running) since Wed 2026-11-11 01:13:45 UTC; 280ms ago
+   Main PID: 1975 (iron-proxy)
+      Tasks: 8 (limit: 9549)
+     Memory: 4.1M (peak: 4.5M)
+        CPU: 9ms
+     CGroup: /system.slice/iron-proxy.service
+             └─1975 /usr/local/bin/iron-proxy -config /etc/iron-proxy/config.yaml
+...
+DNS for the app user:
+127.0.0.1       httpbin.org
+
+Snapshot: iron-proxy (version 1)
+Done. Create machines from this snapshot to get iron-proxy pre-configured.
+```
+
+The snapshot is saved under the name `iron-proxy`. Running the script again with a different `MACHINE_NAME` saves a new version of the same snapshot.
+
+### Launch Machines From the Snapshot
+
+Create machines from the snapshot with iron-proxy already running. Save this as `launch.mjs`:
+
+```javascript
+import { Boxd } from "@boxd-sh/sdk";
+
+const SNAPSHOT_NAME = process.env.SNAPSHOT_NAME || "iron-proxy";
+
+const boxd = new Boxd();
+
+const machine = await boxd.machines.create({
+  name: process.env.MACHINE_NAME, // optional
+  org: process.env.BOXD_ORG,
+  fromSnapshot: SNAPSHOT_NAME,
+});
+await boxd.machines.waitUntilReady(machine.id);
+console.log(`Machine ${machine.name} (${machine.id})`);
+
+// Run commands as the unprivileged app user
+const result = await boxd.machines.exec(machine.id, {
+  command: "sudo -u app curl -s https://httpbin.org/get",
+});
+console.log(result.stdout);
+
+await boxd.machines.delete(machine.id);
+await boxd.close();
+```
+
+Run it:
+
+```bash
+node launch.mjs
+```
+
+The output is the JSON body from `httpbin.org`, fetched through iron-proxy by the `app` user.
+
+### Verify
+
+Check that iron-proxy is intercepting traffic inside a running machine:
+
+```bash
+# Inside the machine (via machines.exec or boxd connect)
+systemctl status iron-proxy iron-proxy-egress
+```
+
+You should see both services active. Make a test request as the `app` user to confirm:
+
+```bash
+sudo -u app curl -sv https://httpbin.org/get 2>&1 | grep "issuer"
+```
+
+If iron-proxy is working, the TLS certificate issuer will be `iron-proxy CA` rather than the real upstream issuer. A domain that is not on the allowlist returns `403`:
+
+```bash
+sudo -u app curl -s -o /dev/null -w "%{http_code}\n" https://example.com
+```
+
+::::
+
+## Customizing the Allowlist
+
+Edit the `domains` array in the `ironProxyConfig` string before creating the snapshot:
+
+```yaml
+transforms:
+  - name: allowlist
+    config:
+      warn: false
+      domains:
+        - "registry.npmjs.org"
+        - "pypi.org"
+        - "api.github.com"
+```
+
+To update an existing deployment, re-run `create-snapshot.mjs` with a new `MACHINE_NAME` to save a new version of the snapshot. Machines you create after that start from the new version.
+
+For the full set of configuration options, see the [configuration reference](/reference/configuration).
+
+## Egress Control With iptables
+
+The snapshot script installs `/usr/local/sbin/iron-proxy-egress` and a oneshot `iron-proxy-egress` systemd unit that runs it on every boot. It adds these rules:
+
+```bash
+# Send DNS from non-root processes to iron-proxy on 127.0.0.1:53
+iptables -t nat -A OUTPUT -p udp --dport 53 -m owner ! --uid-owner root -j REDIRECT --to-ports 53
+iptables -t nat -A OUTPUT -p tcp --dport 53 -m owner ! --uid-owner root -j REDIRECT --to-ports 53
+
+# Allow all loopback traffic (workloads talk to iron-proxy on 127.0.0.1)
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# Allow outbound traffic from root (iron-proxy runs as root)
+iptables -A OUTPUT -m owner --uid-owner root -j ACCEPT
+
+# Allow the redirected DNS queries
+iptables -A OUTPUT -m conntrack --ctstate DNAT -j ACCEPT
+
+# Allow return traffic for established connections
+iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# Reject everything else
+iptables -A OUTPUT -j REJECT --reject-with icmp-port-unreachable
+```
+
+A workload looks up a name through whatever resolver it uses, the query lands on iron-proxy, and iron-proxy answers with `127.0.0.1`. The workload then connects to iron-proxy's HTTP or HTTPS listener. Because the redirect matches every DNS query on port 53, it works without changing `/etc/resolv.conf`.
+
+Non-root processes cannot reach the network directly. Even if a workload hardcodes an IP address or queries its own DNS server, the traffic ends at iron-proxy or is rejected at the kernel level.
+
+### Running Workloads as an Unprivileged User
+
+The iptables rules allow all traffic from root, so workloads **must** run as a non-root user without sudo. The snapshot script creates an `app` user for this purpose. Run all untrusted code as this user:
+
+```javascript
+const result = await boxd.machines.exec(machine.id, {
+  command: "sudo -u app your-command-here",
+});
+```
+
+If a workload runs as root, it can bypass the proxy entirely: its traffic matches the `--uid-owner root` rule and goes straight to the internet. Commands sent with `machines.exec` run as the `boxd` user, which has passwordless sudo, so always wrap untrusted commands in `sudo -u app`. Do not add `app` to the `sudo` or `docker` groups.
+
+### boxd's Built-In Egress Allowlist
+
+boxd can also restrict a machine's egress from outside the machine with an [egress allowlist](https://docs.boxd.sh/guides/egress-allowlist?ref=docs). Nothing inside the machine can change it, root included, so it still holds if a workload escalates to root. It works on hostnames and addresses only, without iron-proxy's TLS interception, logging, or transforms.
+
+The two work well together: iron-proxy for per-request policy and secrets, the allowlist as the outer boundary. A machine created from a snapshot starts without an allowlist, so set it after creating the machine:
+
+```javascript
+import { Boxd } from "@boxd-sh/sdk";
+
+const SNAPSHOT_NAME = process.env.SNAPSHOT_NAME || "iron-proxy";
+
+const boxd = new Boxd();
+
+const machine = await boxd.machines.create({
+  name: process.env.MACHINE_NAME, // optional
+  org: process.env.BOXD_ORG,
+  fromSnapshot: SNAPSHOT_NAME,
+});
+await boxd.machines.waitUntilReady(machine.id);
+console.log(`Machine ${machine.name} (${machine.id})`);
+
+// The same domains as iron-proxy's allowlist, enforced outside the machine
+await boxd.machines.setEgressAllow(machine.id, ["api.github.com", "httpbin.org"]);
+
+// Root bypasses iron-proxy, but not the machine's allowlist
+const allowed = await boxd.machines.exec(machine.id, {
+  command: "sudo curl -s -o /dev/null -w '%{http_code}' https://httpbin.org/get",
+});
+const blocked = await boxd.machines.exec(machine.id, {
+  command: "sudo curl -s -o /dev/null -w '%{http_code}' https://example.com",
+});
+console.log(`root to httpbin.org: ${allowed.stdout}, root to example.com: ${blocked.stdout}`);
+
+await boxd.machines.delete(machine.id);
+await boxd.close();
+```
+
+With the allowlist set, root reaches `httpbin.org` but not `example.com`, while the `app` user still goes through iron-proxy for every request.
+
+## Trusting the CA
+
+The snapshot script trusts the CA system-wide and sets `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, and `REQUESTS_CA_BUNDLE` in `/etc/environment`. Most tools will work without additional configuration. If you run into TLS errors, see the [CA certificate reference](/guides/ca-certificates) for per-runtime details.
+
+## Troubleshooting
+
+### iron-proxy Service Is Not Running
+
+Check the service logs:
+
+```bash
+journalctl -u iron-proxy --no-pager -n 50
+```
+
+If the install failed, `create-snapshot.mjs` prints the install script's output and exits before taking the snapshot. Common causes: network issues during the iron-proxy binary download, or a version string that does not match a GitHub release.
+
+### DNS Resolution Fails
+
+Check that the egress unit ran and the redirect rules are in place:
+
+```bash
+systemctl status iron-proxy-egress
+sudo iptables -t nat -S OUTPUT
+```
+
+Then check that iron-proxy answers DNS:
+
+```bash
+sudo -u app getent hosts httpbin.org
+```
+
+The answer should be `127.0.0.1`.
+
+### TLS Certificate Errors
+
+If you see `certificate signed by unknown authority`, the CA is not trusted by the runtime making the request. Check that `update-ca-certificates` ran successfully during snapshot creation, and ensure the appropriate environment variable is set for your runtime. See [Managing CA Certificates](/guides/ca-certificates) for details.
